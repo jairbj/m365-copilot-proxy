@@ -5,9 +5,16 @@ They are not decorative: the server gates features on them. `variants` and
 `optionsSets` unlock server-side capabilities, and `allowedMessageTypes` is a
 declare-to-receive contract — the server only emits a frame kind the client said it
 can handle, so omitting an entry silently removes the feature rather than erroring.
+
+These are defaults, not truths: they describe one tenant at one moment. A captured
+tenant profile (`m365-copilot-proxy capture`) overrides them — see `profile.py` and
+the accessor functions at the bottom of this module, which are what callers should
+use rather than reading the constants directly.
 """
 
 from __future__ import annotations
+
+from m365_copilot_proxy.bizchat import profile as tenant_profile
 
 WS_HOST = "substrate.office.com"
 WS_PATH = "/m365Copilot/Chathub"
@@ -161,6 +168,11 @@ MODEL_TONES: dict[str, str] = {
     "gpt-5.5-quick": "Gpt_5_5_Chat",
     "gpt-5.5-think-deeper": "Gpt_5_5_Reasoning",
     "gpt-5.6-think-deeper": "Gpt_5_6_Reasoning",
+    # INFERRED from the naming pattern, not confirmed against a live tenant: the
+    # picker offers a 5.6 quick variant, but the reference only ever validated the
+    # reasoning one. If the server answers "Failed to invoke 'Chat'", run `capture`
+    # and let the real value replace this.
+    "gpt-5.6-quick": "Gpt_5_6_Quick",
     # Older generations, still accepted
     "gpt-5.4": "Gpt_5_4_Reasoning",
     "gpt-5.4-quick": "Gpt_5_4_Quick",
@@ -177,6 +189,55 @@ MODEL_TONES: dict[str, str] = {
 MAX_MESSAGES_PER_CONVERSATION = 600
 
 
+# --- Effective values: built-in defaults, overridden by a captured profile ---
+
+
+def model_tones() -> dict[str, str]:
+    """The built-in tone map, with anything the capture learned layered on top."""
+    return {**MODEL_TONES, **tenant_profile.load().tones}
+
+
+def query_defaults() -> dict[str, str]:
+    """Static WebSocket query fields, preferring the captured tenant surface.
+
+    This is where a work/enterprise tenant diverges from the individual one
+    (`agent=work`, `scenario=officeweb`, `licenseType=Premium`), which is exactly
+    the kind of thing that is not worth guessing.
+    """
+    captured = tenant_profile.load().query
+    merged = dict(QUERY_DEFAULTS)
+    for key in QUERY_DEFAULTS:
+        if key in captured:
+            merged[key] = captured[key]
+    if "isEdu" in captured:
+        merged["isEdu"] = captured["isEdu"]
+    return merged
+
+
+def variants() -> str:
+    """The comma-separated feature variants, captured if available."""
+    captured = tenant_profile.load().query.get("variants")
+    return captured if captured else ",".join(VARIANTS)
+
+
+def option_sets(*, generate_images: bool = False) -> list[str]:
+    """The optionsSets to send, captured if available."""
+    captured = tenant_profile.load().option_sets
+    sets = list(captured) if captured else list(CODE_INTERPRETER_OPTIONS_SETS)
+    if generate_images:
+        sets += [s for s in IMAGE_GEN_OPTIONS_SETS if s not in sets]
+    return sets
+
+
+def allowed_message_types(*, generate_images: bool = False) -> list[str]:
+    """The message types we declare we can handle, captured if available."""
+    captured = tenant_profile.load().allowed_message_types
+    types = list(captured) if captured else list(ALLOWED_MESSAGE_TYPES)
+    if generate_images and IMAGE_MESSAGE_TYPE not in types:
+        types.append(IMAGE_MESSAGE_TYPE)
+    return types
+
+
 def tone_for_model(model: str | None) -> str:
     """Resolve a requested model id to a `tone` the server accepts.
 
@@ -184,15 +245,17 @@ def tone_for_model(model: str | None) -> str:
     fall back to the GPT tone — it would serve GPT under a Claude name. Route it to
     the Claude tone instead; everything else gets the default.
     """
+    tones = model_tones()
+    default = tones.get(DEFAULT_MODEL, MODEL_TONES[DEFAULT_MODEL])
     if not model:
-        return MODEL_TONES[DEFAULT_MODEL]
-    exact = MODEL_TONES.get(model)
+        return default
+    exact = tones.get(model)
     if exact:
         return exact
     if model.lower().startswith("claude"):
         return "Claude_Sonnet"
-    return MODEL_TONES[DEFAULT_MODEL]
+    return default
 
 
 def available_models() -> list[str]:
-    return list(MODEL_TONES)
+    return list(model_tones())

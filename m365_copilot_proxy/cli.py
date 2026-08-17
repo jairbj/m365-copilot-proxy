@@ -77,6 +77,56 @@ def status() -> None:
 
 
 @cli.command()
+def capture(
+    merge: bool = typer.Option(
+        True, help="Keep tones from a previous capture that this run did not see."
+    ),
+) -> None:
+    """Learn this tenant's models and surface by watching the real Copilot UI."""
+    from m365_copilot_proxy.bizchat import profile as tenant_profile
+    from m365_copilot_proxy.capture import ProfileCollector
+    from m365_copilot_proxy.capture import run as run_capture
+
+    _setup_logging()
+    collector = ProfileCollector()
+    if merge:
+        previous = tenant_profile.load()
+        collector.tones.update(previous.tones)
+        collector.query.update(previous.query)
+
+    try:
+        asyncio.run(run_capture(collector))
+    except KeyboardInterrupt:
+        typer.echo("")  # keep the ^C off the summary line
+    except Exception as exc:
+        typer.secho(f"Capture failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+
+    captured = collector.build()
+    if captured.is_empty:
+        typer.secho(
+            "Nothing captured. Was a message sent in the chat window?",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    path = tenant_profile.save(captured)
+    typer.echo(f"\nSaved {path}")
+    if captured.query:
+        surface = {
+            key: captured.query[key]
+            for key in ("agent", "scenario", "licenseType")
+            if key in captured.query
+        }
+        typer.echo(f"Surface: {surface}")
+    typer.echo(f"Models ({len(captured.tones)}):")
+    for model_id, tone in sorted(captured.tones.items()):
+        typer.echo(f"  {model_id:<28} tone={tone}")
+    typer.echo("\nRename the ids in that file if you prefer different model names.")
+
+
+@cli.command()
 def logout(
     keep_browser_profile: bool = typer.Option(
         False, help="Keep the browser profile so the next login stays SSO-silent."

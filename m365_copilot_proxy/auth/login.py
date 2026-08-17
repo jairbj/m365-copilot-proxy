@@ -30,7 +30,12 @@ def _notice(message: str) -> None:
     print(f"[login] {message}", file=sys.stderr, flush=True)
 
 
-def _browser_launch_kwargs() -> dict[str, Any]:
+def browser_launch_kwargs() -> dict[str, Any]:
+    """Launch options shared by every browser window this proxy opens.
+
+    The `capture` command reuses these so it presents the same device fingerprint
+    as the login did — a profile that Entra ID already knows.
+    """
     settings = get_settings()
     kwargs: dict[str, Any] = {
         "headless": False,  # the entire point: a human has to see and drive this
@@ -85,7 +90,7 @@ async def _capture_auth_response(auth_uri: str, timeout: float) -> dict[str, str
                 # later logins are SSO-silent and look like a returning familiar
                 # device rather than a brand-new one every time.
                 str(settings.browser_profile_dir),
-                **_browser_launch_kwargs(),
+                **browser_launch_kwargs(),
             )
         except Exception as exc:
             raise LoginError(

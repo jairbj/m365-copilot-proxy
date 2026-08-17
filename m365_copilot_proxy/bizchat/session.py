@@ -92,8 +92,8 @@ class CopilotSession:
             "X-SessionId": self.session_id,
             "ConversationId": self.conversation_id,
             "access_token": token,
-            "variants": ",".join(protocol.VARIANTS),
-            **protocol.QUERY_DEFAULTS,
+            "variants": protocol.variants(),
+            **protocol.query_defaults(),
         }
         return (
             f"wss://{protocol.WS_HOST}{protocol.WS_PATH}/"
@@ -120,11 +120,8 @@ class CopilotSession:
         is_first = self.turn_count == 0
         self.turn_count += 1
 
-        options_sets = list(protocol.CODE_INTERPRETER_OPTIONS_SETS)
-        allowed = list(protocol.ALLOWED_MESSAGE_TYPES)
-        if generate_images:
-            options_sets += protocol.IMAGE_GEN_OPTIONS_SETS
-            allowed.append(protocol.IMAGE_MESSAGE_TYPE)
+        options_sets = protocol.option_sets(generate_images=generate_images)
+        allowed = protocol.allowed_message_types(generate_images=generate_images)
 
         url = self._build_url(token, request_id)
         log.info(

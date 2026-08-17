@@ -153,13 +153,15 @@ async def run_completion(body: ChatCompletionRequest) -> object:
             result=result,
         )
 
-        if body.stream and not buffered:
+        if body.stream:
+            inner = (
+                buffered_stream(stream, result, body, turn, len(body.messages))
+                if buffered
+                else stream_completion(stream, result, body, turn, len(body.messages))
+            )
             lock_transferred = True
             return StreamingResponse(
-                _releasing(
-                    stream_completion(stream, result, body, turn, len(body.messages)),
-                    lock,
-                ),
+                _releasing(inner, lock),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -168,13 +170,6 @@ async def run_completion(body: ChatCompletionRequest) -> object:
         answer = await _append_images(answer, result)
         calls, remainder = parse_tool_calls(answer) if body.tools else ([], answer)
         turn.commit(len(body.messages) + 1)
-
-        if body.stream:
-            return StreamingResponse(
-                buffered_stream(remainder, calls, body, result),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-            )
         return completion_response(remainder, calls, body, result, text)
     finally:
         if not lock_transferred:
@@ -268,14 +263,32 @@ async def stream_completion(
 
 
 async def buffered_stream(
-    text: str,
-    calls: list[ToolCall],
-    body: ChatCompletionRequest,
+    stream: AsyncIterator[str],
     result: TurnResult,
+    body: ChatCompletionRequest,
+    turn: PooledTurn,
+    message_count: int,
 ) -> AsyncIterator[str]:
-    """SSE for the tools path: the answer is already complete, replay it as chunks."""
+    """SSE for the tools path, where the whole answer must be read before emitting.
+
+    A tool call is only recognisable once its fenced block is complete, and half a
+    block must never reach the client. But the opening chunk is sent BEFORE the turn
+    is collected: agentic clients abort a stream that goes quiet for too long
+    (opencode's `chunkTimeout`), and a reasoning model easily takes a minute.
+    """
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     yield _chunk(body.model, completion_id, Delta(role="assistant", content=""))
+
+    try:
+        answer = "".join([chunk async for chunk in stream])
+    except BizChatError as exc:
+        log.warning("Turn failed: %s", exc)
+        yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'upstream_error'}})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    answer = await _append_images(answer, result)
+    calls, text = parse_tool_calls(answer) if body.tools else ([], answer)
 
     if calls:
         tool_deltas = [
@@ -295,6 +308,7 @@ async def buffered_stream(
 
     yield _chunk(body.model, completion_id, Delta(), finish_reason_for(text, bool(calls)))
     yield "data: [DONE]\n\n"
+    turn.commit(message_count + 1)
 
 
 def completion_response(

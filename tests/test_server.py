@@ -193,6 +193,36 @@ async def test_tool_calls_are_returned_structurally(client, fake_bizchat, monkey
     assert "[Available tools]" in fake.chat_arguments["message"]["text"]
 
 
+async def test_the_tools_stream_opens_before_the_answer_is_collected(
+    client, fake_bizchat, monkeypatch
+):
+    # The tools path must read the whole answer before it can spot a tool call, but
+    # an agentic client aborts a stream that stays silent (opencode's chunkTimeout),
+    # so the opening chunk has to go out first.
+    reply = '```tool_call\n{"tool": "run_shell", "arguments": {"command": "ls"}}\n```'
+    fake = await fake_bizchat([snapshot_frame(reply), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "m365-copilot",
+            "stream": True,
+            "messages": [{"role": "user", "content": "list the files"}],
+            "tools": [
+                {"type": "function", "function": {"name": "run_shell", "description": "run"}}
+            ],
+        },
+    )
+    events = sse_events(response.text)
+    assert events[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert "tool_calls" not in events[0]["choices"][0]["delta"]
+
+    call_event = next(e for e in events if e["choices"][0]["delta"].get("tool_calls"))
+    assert call_event["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "run_shell"
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
 async def test_an_empty_disengaged_turn_is_explained(client, fake_bizchat, monkeypatch):
     fake = await fake_bizchat([snapshot_frame("", messageType="Disengaged"), COMPLETION])
     route_new_sessions_to(fake, monkeypatch)
