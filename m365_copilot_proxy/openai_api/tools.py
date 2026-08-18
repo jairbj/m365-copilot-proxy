@@ -34,31 +34,51 @@ _FINAL_RE = re.compile(r'\{\s*"final"\s*:\s*("(?:[^"\\]|\\.)*")\s*\}')
 
 INSTRUCTIONS_HEADER = "[Available tools]"
 
+#: The static half of the contract: how to shape a call, and when to keep calling.
+#: It is kept apart from the tool list because it is the half worth installing ONCE —
+#: pasted into a declarative agent's instructions, where Copilot honours it, rather
+#: than repeated in every conversation where it ignores it (see
+#: `agent_instructions.py`). The tool list cannot live there: it changes per request.
+TOOL_CONTRACT = """\
+To call a tool, reply with ONLY a fenced block:
 
-def format_tool_instructions(tools: list[ToolDef]) -> str:
-    """Render the tool contract that gets prepended to the conversation."""
+```tool_call
+{"tool": "tool_name", "arguments": {"arg": "value"}}
+```
+
+Rules:
+- One block per call; emit several blocks to call several tools.
+- Put nothing else in a reply that contains a tool call — no prose, no
+  explanation, no markdown around it.
+- `arguments` must be a JSON object matching the tool's parameters.
+- Never invent a tool result: stop after the call and wait for the
+  <tool_response> the caller sends back.
+- When you do not need a tool, answer normally with no fenced block.
+
+A task takes several turns:
+- Most tasks need MORE THAN ONE call, made one per turn. A call coming back
+  with a result is not a reason to conclude.
+- After every <tool_response>, ask what is still missing. If anything is,
+  emit the next call instead of answering.
+- Never describe the next step in prose — take it, by calling the tool.
+- Answer without a fenced block only once the task is finished and no
+  further call is needed."""
+
+
+def format_tool_instructions(tools: list[ToolDef], *, include_contract: bool = True) -> str:
+    """Render the tool contract that gets prepended to the conversation.
+
+    `include_contract=False` sends the tool list alone. It is for a turn bound to a
+    declarative agent that already carries `TOOL_CONTRACT` in its instructions:
+    repeating it there would spend the turn on text the agent holds permanently.
+    """
     if not tools:
         return ""
 
-    lines = [
-        INSTRUCTIONS_HEADER,
-        "You can call the tools below. To call one, reply with ONLY a fenced block:",
-        "",
-        "```tool_call",
-        '{"tool": "tool_name", "arguments": {"arg": "value"}}',
-        "```",
-        "",
-        "Rules:",
-        "- One block per call; emit several blocks to call several tools.",
-        "- Put nothing else in a reply that contains a tool call — no prose, no",
-        "  explanation, no markdown around it.",
-        "- `arguments` must be a JSON object matching the tool's parameters.",
-        "- Never invent a tool result: stop after the call and wait for the",
-        "  <tool_response> the caller sends back.",
-        "- When you do not need a tool, answer normally with no fenced block.",
-        "",
-        "Tools:",
-    ]
+    lines = [INSTRUCTIONS_HEADER]
+    if include_contract:
+        lines += ["You can call the tools below.", "", TOOL_CONTRACT, ""]
+    lines.append("Tools:")
 
     for tool in tools:
         function = tool.function

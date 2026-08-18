@@ -6,6 +6,7 @@ import json
 
 from m365_copilot_proxy.openai_api.schemas import FunctionDef, ToolDef
 from m365_copilot_proxy.openai_api.tools import (
+    TOOL_CONTRACT,
     clean_loose_text,
     format_tool_instructions,
     parse_tool_calls,
@@ -107,3 +108,31 @@ def test_assistant_calls_replay_as_fenced_blocks():
     # A replayed transcript must parse back to the same call.
     again, _ = parse_tool_calls(replayed)
     assert again[0].function.name == "run_shell"
+
+
+class TestTheContract:
+    """The half of the instructions worth installing in a declarative agent."""
+
+    def test_it_teaches_the_loop_not_just_the_format(self):
+        # Copilot's failure mode is answering after one call; the contract has to
+        # say, in as many words, that a task usually takes several.
+        assert "MORE THAN ONE call" in TOOL_CONTRACT
+        assert "<tool_response>" in TOOL_CONTRACT
+        assert "```tool_call" in TOOL_CONTRACT
+
+    def test_the_rendered_instructions_carry_it(self):
+        rendered = format_tool_instructions([SHELL_TOOL])
+        assert TOOL_CONTRACT in rendered
+        assert "run_shell" in rendered
+
+    def test_it_can_be_left_out_for_an_agent_that_already_has_it(self):
+        rendered = format_tool_instructions([SHELL_TOOL], include_contract=False)
+        assert TOOL_CONTRACT not in rendered
+        # The tool list itself still has to travel: the agent cannot know it.
+        assert "run_shell" in rendered
+        assert "command (string, required)" in rendered
+        assert len(rendered) < len(format_tool_instructions([SHELL_TOOL]))
+
+    def test_no_tools_means_no_instructions_either_way(self):
+        assert format_tool_instructions([], include_contract=False) == ""
+        assert format_tool_instructions([]) == ""

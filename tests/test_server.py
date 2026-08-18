@@ -295,3 +295,188 @@ async def test_models_lists_the_work_variants(client: httpx.AsyncClient):
 async def test_health_reports_the_conversation_count(client: httpx.AsyncClient):
     response = await client.get("/health")
     assert response.json()["status"] == "ok"
+
+
+# --- Declarative agents ------------------------------------------------------
+
+
+@pytest.fixture
+def captured_agent(tmp_path, monkeypatch):
+    """A profile holding one captured agent, isolated from the real config dir."""
+    import json
+
+    from m365_copilot_proxy.bizchat import profile as tenant_profile
+    from m365_copilot_proxy.config import get_settings
+
+    monkeypatch.setenv("M365_CONFIG_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    tenant_profile.reset_cache()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    tenant_profile.profile_path().write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "sales-bot": {
+                        "surface": {
+                            "query": {"agent": "work", "scenario": "officeweb"},
+                            "option_sets": ["agent_set"],
+                            "allowed_message_types": ["Chat"],
+                        },
+                        "thread_level_gpt_id": {"gptId": "agent-guid"},
+                        "extra_extension_parameters": {"k": "v"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    tenant_profile.reset_cache()
+    yield "agent:sales-bot"
+    get_settings.cache_clear()
+    tenant_profile.reset_cache()
+
+
+async def test_a_captured_agent_is_offered_as_a_model(client, captured_agent):
+    response = await client.get("/v1/models")
+    ids = {model["id"] for model in response.json()["data"]}
+
+    assert captured_agent in ids
+    # No Work IQ twin: the agent UI has neither that toggle nor a model picker.
+    assert f"{captured_agent}-work" not in ids
+
+
+async def test_an_agent_turn_carries_its_id_and_drops_the_system_block(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hello"},
+            ],
+        },
+    )
+
+    arguments = fake.chat_arguments
+    assert arguments["threadLevelGptId"] == {"gptId": "agent-guid"}
+    assert arguments["extraExtensionParameters"] == {"k": "v"}
+    assert arguments["optionsSets"] == ["agent_set"]
+    # The agent carries the instructions itself, and honours them.
+    assert arguments["message"]["text"] == "hello"
+    # No model picker in the agent UI, so no tone is invented for it.
+    assert "tone" not in arguments
+
+
+async def test_an_agent_turn_sends_the_tool_list_without_the_contract(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    # The contract lives in the agent's instructions; the tool list cannot, because
+    # it changes with every request.
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "run_shell", "description": "run it"}}
+            ],
+        },
+    )
+
+    sent = fake.chat_arguments["message"]["text"]
+    assert "run_shell" in sent
+    assert "```tool_call" not in sent
+
+
+async def test_an_agent_that_has_drifted_can_be_sent_the_instructions_anyway(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    from m365_copilot_proxy.config import get_settings
+
+    monkeypatch.setenv("M365_AGENT_SEND_SYSTEM", "1")
+    get_settings.cache_clear()
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hello"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "run_shell", "description": "run it"},
+                }
+            ],
+        },
+    )
+
+    sent = fake.chat_arguments["message"]["text"]
+    assert "be terse" in sent
+    # The contract comes back with it: the flag means "treat this like plain chat".
+    assert "```tool_call" in sent
+
+
+async def test_an_uncaptured_agent_is_an_error_not_a_plain_chat(client, captured_agent):
+    # Serving plain Copilot under an agent's name would be invisible to the caller.
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "agent:nope", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 400
+    assert "capture" in response.json()["error"]["message"]
+
+
+# --- The system prompt, for pasting into an agent ----------------------------
+
+
+async def test_the_system_prompt_is_recorded_and_served_with_its_size(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "claude-sonnet",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hello"},
+            ],
+        },
+    )
+
+    payload = (await client.get("/v1/system-prompt")).json()
+    assert payload["text"].endswith("be terse")
+    assert payload["limit"] == 8000
+    assert payload["chars"] == len(payload["text"])
+    assert payload["over_by"] == 0
+    assert payload["source"]["model"] == "claude-sonnet"
+
+    listed = (await client.get("/v1/system-prompts")).json()["data"]
+    assert [entry["model"] for entry in listed] == ["claude-sonnet"]
+
+    as_text = await client.get("/v1/system-prompt", params={"format": "text"})
+    assert as_text.text == payload["text"]
+
+
+async def test_the_system_prompt_endpoint_says_when_there_is_nothing_yet(
+    client, captured_agent
+):
+    response = await client.get("/v1/system-prompt")
+
+    assert response.status_code == 404
+    assert "No system prompt recorded" in response.json()["error"]["message"]

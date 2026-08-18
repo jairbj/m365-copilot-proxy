@@ -57,6 +57,7 @@ uv run m365-copilot-proxy doctor   # checks TLS reachability (see below if it fa
 uv run m365-copilot-proxy login    # opens a browser; complete SSO/MFA yourself
 uv run m365-copilot-proxy status   # confirms silent refresh works
 uv run m365-copilot-proxy capture  # learns your tenant's models — see below
+uv run m365-copilot-proxy prompt   # the instructions to paste into an agent
 uv run m365-copilot-proxy serve    # http://127.0.0.1:8765/v1
 ```
 
@@ -131,6 +132,7 @@ invocation, which carries the `tone` behind the entry you picked in the model
 selector.
 
 So: **pick a model, send any short message, wait for the reply to start, repeat.**
+Do the same inside one of your declarative agents to record it — see below.
 Each new tone is printed as it is seen. Run it once with Work IQ on and once with it
 off to record both surfaces (see below) — each run keeps the other. Close the window
 when you are done and the result lands in
@@ -205,6 +207,100 @@ become separate Copilot conversations even with identical history.
 > If you captured a profile before this existed, it migrates into whichever slot
 > its `agent` names. A profile captured with Work IQ on was pinning every request
 > to work grounding; after upgrading, the default becomes off.
+
+### Declarative agents: instructions it actually follows
+
+Copilot regularly ignores a system prompt. There is no field for one on the wire —
+the proxy glues it into the first turn as a `[System instructions]` block, and the
+model treats it as something a user said, which it is free to talk past. Put the same
+text in the instructions of a **declarative agent** (the "Create agent" flow in the
+Copilot UI) and it is honoured instead.
+
+So: build the agent once, point the proxy at it, and every turn starts inside it.
+
+**1. Get the text.** The proxy keeps a copy of the system prompt of each conversation
+it starts, and prints it composed with the tool-calling contract:
+
+```bash
+uv run m365-copilot-proxy prompt              # latest, contract + system prompt
+uv run m365-copilot-proxy prompt --list       # what has been recorded
+uv run m365-copilot-proxy prompt --contract   # the tool contract alone
+uv run m365-copilot-proxy prompt --raw        # the client's system prompt alone
+uv run m365-copilot-proxy prompt --out agent.md
+```
+
+The document goes to stdout and its size to stderr, so it pipes cleanly:
+
+```
+  Tool calling           980 chars
+  System prompt        9,210 chars
+  Total               10,190 chars — 2,190 over the agent's 8,000-character field.
+```
+
+An agent's instructions field holds **8000 characters** and nothing here trims to
+fit: which paragraph to drop is your call, not the proxy's. The tool contract is
+~1k of that, and it is the half worth installing — it is what teaches the model to
+keep calling tools across turns instead of answering after the first result.
+
+`GET /v1/system-prompt` returns the same document as JSON (`?format=text` for the
+raw body), and `GET /v1/system-prompts` lists what has been recorded. Recording is
+local and on by default; `M365_RECORD_SYSTEM_PROMPTS=0` turns it off.
+
+**2. Paste it** into the agent's instructions in the Copilot UI and save.
+
+**3. Capture the agent**, the same way models are captured — open it in the chat
+window and send it any message:
+
+```bash
+uv run m365-copilot-proxy capture
+```
+
+The agent's turn carries a `threadLevelGptId`, the opaque object that puts a thread
+inside it. That object is recorded whole and replayed unread, along with the rest of
+that connection's shape, under `agents` in `profile.json`:
+
+```json
+{
+  "agents": {
+    "agent-1": {
+      "thread_level_gpt_id": { "...": "opaque" },
+      "surface": { "query": { "agent": "work" }, "option_sets": ["..."] }
+    }
+  }
+}
+```
+
+Rename `agent-1` to whatever you like — the name is not on the wire, and a later
+capture recognises the agent by its id, so the rename survives.
+
+**4. Use it** as a model id:
+
+```bash
+curl -N http://127.0.0.1:8765/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"agent:agent-1","messages":[{"role":"user","content":"hello"}]}'
+```
+
+`GET /v1/models` lists every captured agent as `agent:<name>`, so it shows up in a
+client's model picker next to the ordinary ids.
+
+**What an agent does not have.** The agent UI offers no model selector and no Work
+IQ toggle, so neither does the proxy here: an `agent:` id takes no `-work` suffix,
+and no `tone` is sent for it — whatever model and grounding the agent was built with
+is what you get. An `agent:` id that was never captured fails the turn rather than
+quietly serving plain Copilot under the agent's name.
+
+Because the agent carries the instructions, an agent turn does **not** repeat the
+`[System instructions]` block or the tool contract; only the per-request tool list
+still travels, since the agent cannot know it. If you change the client's prompt and
+have not updated the agent yet, `M365_AGENT_SEND_SYSTEM=1` puts both back inline, so
+the turn carries what a plain-Copilot one would.
+
+**Creating the agent from here** is not supported: it is a browser flow with no
+documented API. `capture --record-api` writes the site's own write calls (method,
+URL, body — never headers, which is where the token is) to
+`<config_dir>/capture/agent-builder-*.ndjson`, which is the evidence needed to judge
+whether that could ever change. Nothing replays them.
 
 ### Tool calling
 
@@ -454,6 +550,8 @@ Everything is settable through `M365_*` environment variables or a `.env` file:
 | `M365_OUTPUT_CHAR_CEILING` | `12000` | Report `finish_reason: "length"` above this; `0` disables |
 | `M365_IMAGES_ALWAYS` | `false` | Enable image generation on every turn |
 | `M365_WORK_IQ` | `false` | Ground answers in work content by default |
+| `M365_RECORD_SYSTEM_PROMPTS` | `true` | Keep each conversation's system prompt for `prompt` |
+| `M365_AGENT_SEND_SYSTEM` | `false` | Send the system block and tool contract on an agent turn |
 | `M365_DUMP_FRAMES` | `false` | Write every SignalR frame to `<config_dir>/frames/` |
 | `M365_LOG_LEVEL` | `INFO` | Logging level |
 

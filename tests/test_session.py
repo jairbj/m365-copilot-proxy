@@ -234,7 +234,7 @@ async def test_a_wss_url_connects_without_an_ssl_argument_error(monkeypatch):
 
     session = CopilotSession()
     session._build_url = (
-        lambda token, request_id, work_iq=None: "wss://127.0.0.1:1/m365Copilot/Chathub/a@b"
+        lambda *args, **kwargs: "wss://127.0.0.1:1/m365Copilot/Chathub/a@b"
     )
 
     with pytest.raises(OSError):  # connection refused, NOT ValueError

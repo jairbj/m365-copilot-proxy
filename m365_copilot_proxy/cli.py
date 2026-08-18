@@ -6,11 +6,16 @@ import asyncio
 import logging
 import shutil
 import sys
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 
 from m365_copilot_proxy import tls
 from m365_copilot_proxy.config import get_settings
+
+if TYPE_CHECKING:
+    from m365_copilot_proxy.agent_instructions import Document
 
 cli = typer.Typer(
     add_completion=False,
@@ -112,11 +117,16 @@ def doctor() -> None:
 @cli.command()
 def capture(
     merge: bool = typer.Option(
-        True, help="Keep tones and surfaces from previous captures this run did not see."
+        True, help="Keep tones, surfaces and agents from previous captures this run did not see."
+    ),
+    record_api: bool = typer.Option(
+        False,
+        help="Also record the site's own write calls (no headers) for later study.",
     ),
 ) -> None:
     """Learn this tenant's models and surfaces by watching the real Copilot UI."""
     from m365_copilot_proxy.bizchat import profile as tenant_profile
+    from m365_copilot_proxy.bizchat import protocol
     from m365_copilot_proxy.capture import ProfileCollector
     from m365_copilot_proxy.capture import run as run_capture
 
@@ -128,9 +138,13 @@ def capture(
         previous = tenant_profile.load()
         collector.tones.update(previous.tones)
         collector.surfaces.update(previous.surfaces)
+        # Agents are matched by their id, not their name, so a renamed one is
+        # updated in place rather than reappearing under a fresh `agent-N`.
+        collector.agents.update(previous.agents)
 
+    recorder = None
     try:
-        asyncio.run(run_capture(collector))
+        recorder = asyncio.run(run_capture(collector, record_api=record_api))
     except KeyboardInterrupt:
         typer.echo("")  # keep the ^C off the summary line
     except Exception as exc:
@@ -168,8 +182,110 @@ def capture(
     typer.echo(f"Models ({len(captured.tones)}):")
     for model_id, tone in sorted(captured.tones.items()):
         typer.echo(f"  {model_id:<28} tone={tone}")
+
+    if captured.agents:
+        typer.echo(f"Agents ({len(captured.agents)}):")
+        for slug in sorted(captured.agents):
+            typer.echo(f"  {protocol.AGENT_ID_PREFIX}{slug}")
+        typer.echo("An agent brings its own model and grounding: no tone, no Work IQ.")
+        typer.echo("Paste its instructions with `m365-copilot-proxy prompt`.")
+
+    if recorder is not None and recorder.count:
+        typer.echo(f"\nRecorded {recorder.count} write calls to {recorder.path}")
+        typer.echo("Nothing replays them — they are there to read.")
+
     typer.echo("\nRename the ids in that file if you prefer different model names.")
     typer.echo("Add `-work` to any id to ground that turn in your work content.")
+
+
+@cli.command()
+def prompt(
+    key: str = typer.Option(None, help="Show one recorded conversation instead of the latest."),
+    show_list: bool = typer.Option(False, "--list", help="List what has been recorded."),
+    out: str = typer.Option("", "--out", help="Write the document to a file."),
+    raw: bool = typer.Option(False, help="The client's system prompt alone, no tool contract."),
+    contract: bool = typer.Option(False, help="The tool contract alone, no system prompt."),
+) -> None:
+    """Show the instructions to paste into a declarative agent.
+
+    M365 Copilot often ignores the system prompt the proxy inlines, and honours a
+    declarative agent's instructions instead. This prints what to put there: the
+    document goes to stdout, its size to stderr, so it can be piped straight into a
+    file or a clipboard command.
+    """
+    from m365_copilot_proxy import agent_instructions
+
+    _setup_logging("WARNING")
+
+    if show_list:
+        records = agent_instructions.list_records()
+        if not records:
+            typer.secho("Nothing recorded yet.", fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(1)
+        for entry in records:
+            typer.echo(
+                f"{entry.key}  {len(entry.system_text):>6} chars  "
+                f"{entry.model or '?':<20} {entry.recorded_at or ''}"
+            )
+            if entry.label:
+                typer.echo(f"    {entry.label}")
+        return
+
+    if raw and contract:
+        typer.secho("Choose --raw or --contract, not both.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+
+    if contract:
+        # The contract stands on its own: it is the same text for every client, so
+        # it needs no recording to exist.
+        document = agent_instructions.compose(contract=True, prompt=False)
+    else:
+        record = agent_instructions.load(key) if key else agent_instructions.latest()
+        if record is None:
+            typer.secho(
+                "No system prompt recorded yet. Send one request through the proxy "
+                "first, then run this again.",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            raise typer.Exit(1)
+        document = record.compose(contract=not raw, prompt=True)
+
+    if out:
+        destination = Path(out)
+        destination.write_text(document.text, encoding="utf-8")
+        typer.echo(f"Wrote {destination}")
+    else:
+        typer.echo(document.text)
+
+    _report_size(document)
+
+
+def _report_size(document: Document) -> None:
+    """Size breakdown on stderr, so stdout stays pasteable."""
+    from m365_copilot_proxy.agent_instructions import INSTRUCTIONS_LIMIT
+
+    if document.key:
+        typer.secho(f"\nFrom {document.model or '?'} ({document.key})", err=True)
+    for title, chars in document.breakdown():
+        typer.secho(f"  {title:<16} {chars:>7,} chars", err=True)
+
+    limit = INSTRUCTIONS_LIMIT
+    if document.fits:
+        typer.secho(
+            f"  {'Total':<16} {document.chars:>7,} chars — fits the agent's "
+            f"{limit:,}-character field.",
+            fg=typer.colors.GREEN,
+            err=True,
+        )
+        return
+    typer.secho(
+        f"  {'Total':<16} {document.chars:>7,} chars — {document.over_by:,} over the "
+        f"agent's {limit:,}-character field. Trim it before pasting; nothing here "
+        "cuts it for you.",
+        fg=typer.colors.YELLOW,
+        err=True,
+    )
 
 
 @cli.command()

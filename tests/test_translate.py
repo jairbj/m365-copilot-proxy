@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from m365_copilot_proxy.openai_api.schemas import ChatMessage
-from m365_copilot_proxy.openai_api.translate import build_turn_text, first_user_text
+from m365_copilot_proxy.openai_api.translate import (
+    build_turn_text,
+    first_user_text,
+    system_block,
+    system_texts,
+)
 
 
 def msg(role: str, content, **extra) -> ChatMessage:
@@ -138,3 +143,45 @@ class TestTheDeveloperRole:
                     msg("user", "c")]
         text = build_turn_text(messages, start_index=2, is_new_conversation=False)
         assert text == "c"
+
+
+class TestTheSystemBlock:
+    """The text a declarative agent takes over from the turn."""
+
+    def test_it_is_the_same_block_the_turn_carries(self):
+        messages = [msg("system", "be terse"), msg("developer", "and precise"), msg("user", "hi")]
+        block = system_block(messages)
+
+        assert block == "[System instructions]\nbe terse\n\nand precise"
+        assert block in build_turn_text(messages, start_index=0, is_new_conversation=True)
+
+    def test_no_system_message_means_no_block(self):
+        assert system_block([msg("user", "hi")]) == ""
+        assert system_texts([msg("user", "hi")]) == []
+
+    def test_an_agent_turn_leaves_it_out(self):
+        # The agent carries these instructions itself, and honours them — repeating
+        # them here would spend the turn on text it already has.
+        messages = [msg("system", "be terse"), msg("user", "hi")]
+        text = build_turn_text(
+            messages, start_index=0, is_new_conversation=True, include_system=False
+        )
+        assert text == "hi"
+
+    def test_leaving_it_out_keeps_the_rest_of_the_transcript(self):
+        messages = [
+            msg("system", "be terse"),
+            msg("user", "hi"),
+            msg("assistant", "hello"),
+            msg("user", "and now?"),
+        ]
+        text = build_turn_text(
+            messages,
+            start_index=0,
+            is_new_conversation=True,
+            tool_instructions="[Available tools]",
+            include_system=False,
+        )
+        assert "be terse" not in text
+        assert text.startswith("[Available tools]")
+        assert "User: hi" in text and "Assistant: hello" in text

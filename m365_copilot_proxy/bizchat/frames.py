@@ -88,59 +88,70 @@ def build_chat_invocation(
     request_id: str,
     session_id: str,
     is_start_of_session: bool,
-    tone: str,
+    tone: str | None,
     options_sets: list[str] | None = None,
     allowed_message_types: list[str] | None = None,
     plugin_list: list[dict[str, Any]] | None = None,
+    thread_level_gpt_id: dict[str, Any] | None = None,
+    extra_extension_parameters: dict[str, Any] | None = None,
+    source: str = "officeweb",
     locale: str = "en-us",
     time_zone: str = "UTC",
 ) -> dict[str, Any]:
-    """The type:4 `chat` invocation carrying the user's turn."""
+    """The type:4 `chat` invocation carrying the user's turn.
+
+    `thread_level_gpt_id` is what puts the turn inside a declarative agent — the
+    custom agents built in the Copilot UI, which honour their own instructions where
+    plain chat ignores the ones we inline. It is opaque: `capture` records the object
+    the real client sends and this replays it unread. Empty means plain Copilot.
+
+    `tone` is None for an agent, whose UI has no model picker: the field is then left
+    out of the invocation entirely rather than filled with a guess.
+    """
+    argument: dict[str, Any] = {
+        "source": source,
+        "clientCorrelationId": request_id,
+        "sessionId": session_id,
+        "optionsSets": options_sets or [],
+        "streamingMode": "ConciseWithPadding",
+        "spokenTextMode": "None",
+        "options": {},
+        "extraExtensionParameters": dict(extra_extension_parameters or {}),
+        "allowedMessageTypes": allowed_message_types or list(protocol.ALLOWED_MESSAGE_TYPES),
+        "sliceIds": [],
+        "threadLevelGptId": dict(thread_level_gpt_id or {}),
+        "traceId": request_id,
+        "isStartOfSession": is_start_of_session,
+        "clientInfo": {**protocol.CLIENT_INFO, "clientSessionId": session_id},
+        "message": {
+            "author": "user",
+            "inputMethod": "Keyboard",
+            "text": text,
+            "entityAnnotationTypes": list(protocol.ENTITY_ANNOTATION_TYPES),
+            "requestId": request_id,
+            "locationInfo": {"timeZoneOffset": 0, "timeZone": time_zone},
+            "locale": locale,
+            "messageType": "Chat",
+            "experienceType": "Default",
+            "adaptiveCards": [],
+            "clientPreferences": {},
+        },
+        "plugins": (
+            [dict(p) for p in plugin_list]
+            if plugin_list is not None
+            else [dict(protocol.BING_PLUGIN)]
+        ),
+        "isSbsSupported": True,
+        "renderReferencesBehindEOS": True,
+        "disconnectBehavior": "continue",
+    }
+    if tone is not None:
+        argument["tone"] = tone
     return {
         "type": TYPE_CLIENT_INVOCATION,
         "target": "chat",
         "invocationId": "0",
-        "arguments": [
-            {
-                "source": "officeweb",
-                "clientCorrelationId": request_id,
-                "sessionId": session_id,
-                "optionsSets": options_sets or [],
-                "streamingMode": "ConciseWithPadding",
-                "spokenTextMode": "None",
-                "options": {},
-                "extraExtensionParameters": {},
-                "allowedMessageTypes": allowed_message_types
-                or list(protocol.ALLOWED_MESSAGE_TYPES),
-                "sliceIds": [],
-                "threadLevelGptId": {},
-                "traceId": request_id,
-                "isStartOfSession": is_start_of_session,
-                "clientInfo": {**protocol.CLIENT_INFO, "clientSessionId": session_id},
-                "message": {
-                    "author": "user",
-                    "inputMethod": "Keyboard",
-                    "text": text,
-                    "entityAnnotationTypes": list(protocol.ENTITY_ANNOTATION_TYPES),
-                    "requestId": request_id,
-                    "locationInfo": {"timeZoneOffset": 0, "timeZone": time_zone},
-                    "locale": locale,
-                    "messageType": "Chat",
-                    "experienceType": "Default",
-                    "adaptiveCards": [],
-                    "clientPreferences": {},
-                },
-                "plugins": (
-                    [dict(p) for p in plugin_list]
-                    if plugin_list is not None
-                    else [dict(protocol.BING_PLUGIN)]
-                ),
-                "isSbsSupported": True,
-                "tone": tone,
-                "renderReferencesBehindEOS": True,
-                "disconnectBehavior": "continue",
-            }
-        ],
+        "arguments": [argument],
     }
 
 

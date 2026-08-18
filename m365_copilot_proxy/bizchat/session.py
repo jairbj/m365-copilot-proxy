@@ -23,6 +23,7 @@ from m365_copilot_proxy import tls
 from m365_copilot_proxy.auth.tokens import decode_jwt, redact
 from m365_copilot_proxy.bizchat import frames, protocol
 from m365_copilot_proxy.bizchat.images import GeneratedImage, capture_images
+from m365_copilot_proxy.bizchat.profile import DeclarativeAgent
 from m365_copilot_proxy.config import get_settings
 
 log = logging.getLogger(__name__)
@@ -85,7 +86,13 @@ class CopilotSession:
         self.messages_used = 0
         log.info("Rotated to a new conversation: cid=%s", self.conversation_id)
 
-    def _build_url(self, token: str, request_id: str, work_iq: bool | None = None) -> str:
+    def _build_url(
+        self,
+        token: str,
+        request_id: str,
+        work_iq: bool | None = None,
+        agent: DeclarativeAgent | None = None,
+    ) -> str:
         claims = decode_jwt(token)
         query = {
             "chatsessionid": request_id,
@@ -93,8 +100,8 @@ class CopilotSession:
             "X-SessionId": self.session_id,
             "ConversationId": self.conversation_id,
             "access_token": token,
-            "variants": protocol.variants(work_iq),
-            **protocol.query_defaults(work_iq),
+            "variants": protocol.variants(work_iq, agent),
+            **protocol.query_defaults(work_iq, agent),
         }
         return (
             f"wss://{protocol.WS_HOST}{protocol.WS_PATH}/"
@@ -109,12 +116,16 @@ class CopilotSession:
         model: str = protocol.DEFAULT_MODEL,
         generate_images: bool = False,
         work_iq: bool | None = None,
+        agent: DeclarativeAgent | None = None,
         result: TurnResult | None = None,
     ) -> AsyncIterator[str]:
         """Send one turn and yield the answer incrementally.
 
         Pass a `TurnResult` in to read the turn's metadata afterwards — an async
         generator cannot return a value to its consumer.
+
+        `agent` puts the turn inside a captured declarative agent, which replaces the
+        whole surface: its own connection fields, optionsSets, plugins and tone.
         """
         settings = get_settings()
         result = result if result is not None else TurnResult()
@@ -122,20 +133,22 @@ class CopilotSession:
         is_first = self.turn_count == 0
         self.turn_count += 1
 
-        options_sets = protocol.option_sets(work_iq=work_iq, generate_images=generate_images)
-        allowed = protocol.allowed_message_types(
-            work_iq=work_iq, generate_images=generate_images
+        options_sets = protocol.option_sets(
+            work_iq=work_iq, generate_images=generate_images, agent=agent
         )
-        plugin_list = protocol.plugins(work_iq)
+        allowed = protocol.allowed_message_types(
+            work_iq=work_iq, generate_images=generate_images, agent=agent
+        )
+        plugin_list = protocol.plugins(work_iq, agent)
 
-        url = self._build_url(token, request_id, work_iq)
+        url = self._build_url(token, request_id, work_iq, agent)
         # The surface is in the log because "why did this answer not find my email"
         # is exactly the question it answers.
         log.info(
             "Turn %d: model=%s surface=%s cid=%s images=%s",
             self.turn_count,
             model,
-            protocol.query_defaults(work_iq).get("agent"),
+            protocol.query_defaults(work_iq, agent).get("agent"),
             self.conversation_id,
             generate_images,
         )
@@ -203,6 +216,7 @@ class CopilotSession:
                                     options_sets=options_sets,
                                     allowed=allowed,
                                     plugin_list=plugin_list,
+                                    agent=agent,
                                 )
                                 continue
 
@@ -283,6 +297,7 @@ class CopilotSession:
         options_sets: list[str],
         allowed: list[str],
         plugin_list: list[dict[str, Any]] | None = None,
+        agent: DeclarativeAgent | None = None,
     ) -> None:
         """Send the chat invocation and its mandatory Metrics companion."""
         chat = frames.build_chat_invocation(
@@ -294,6 +309,9 @@ class CopilotSession:
             options_sets=options_sets,
             allowed_message_types=allowed,
             plugin_list=plugin_list,
+            thread_level_gpt_id=agent.thread_level_gpt_id if agent else None,
+            extra_extension_parameters=agent.extra_extension_parameters if agent else None,
+            source=(agent.source if agent and agent.source else "officeweb"),
         )
         metrics = frames.build_metrics()
         self._dump(request_id, "send", chat)

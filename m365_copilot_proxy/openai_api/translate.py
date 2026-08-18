@@ -27,6 +27,21 @@ SYSTEM_HEADER = "[System instructions]"
 SYSTEM_ROLES = frozenset({"system", "developer"})
 
 
+def system_texts(messages: Sequence[ChatMessage]) -> list[str]:
+    """Every system/developer message's text, in order, empties dropped."""
+    return [text for m in messages if m.role in SYSTEM_ROLES if (text := m.text())]
+
+
+def system_block(messages: Sequence[ChatMessage]) -> str:
+    """The `[System instructions]` block for these messages, or "" when there is none.
+
+    Split out of `build_turn_text` because the same text is what gets exported for a
+    declarative agent's instructions field — see `agent_instructions.py`.
+    """
+    texts = system_texts(messages)
+    return f"{SYSTEM_HEADER}\n" + "\n\n".join(texts) if texts else ""
+
+
 def first_user_text(messages: Sequence[ChatMessage]) -> str:
     """The text used to fingerprint the conversation."""
     for message in messages:
@@ -66,6 +81,7 @@ def build_turn_text(
     start_index: int,
     is_new_conversation: bool,
     tool_instructions: str = "",
+    include_system: bool = True,
 ) -> str:
     """Render the text to send for this turn.
 
@@ -73,13 +89,16 @@ def build_turn_text(
     the full labelled transcript. On a live one only the tail matters, unlabelled,
     so a single user message reads as a normal message rather than a transcript
     excerpt.
+
+    `include_system=False` leaves the system block out even on a new conversation.
+    It is for a turn bound to a declarative agent, which carries that text in its
+    own instructions — where Copilot actually honours it.
     """
     if is_new_conversation:
         blocks: list[str] = []
-        system_texts = [m.text() for m in messages if m.role in SYSTEM_ROLES]
-        system_texts = [t for t in system_texts if t]
-        if system_texts:
-            blocks.append(f"{SYSTEM_HEADER}\n" + "\n\n".join(system_texts))
+        block = system_block(messages) if include_system else ""
+        if block:
+            blocks.append(block)
         if tool_instructions:
             blocks.append(tool_instructions)
 
