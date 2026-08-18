@@ -94,14 +94,17 @@ one tone. `GET /v1/models` lists them all.
 
 | Model id | Backing model |
 | --- | --- |
-| `m365-copilot`, `auto` | Copilot's own routing |
-| `quick`, `think-deeper` | GPT fast / reasoning |
+| `magic` | Copilot's own routing (the picker's "Automatic") |
+| `chat`, `reasoning` | quick answer / think deeper |
 | `claude-sonnet`, `claude-opus` | Anthropic models on the Copilot subscription |
-| `claude-sonnet-think-deeper` | Claude reasoning |
-| `gpt-5.5`, `gpt-5.5-think-deeper` | GPT-5.5 |
-| `gpt-5.6-think-deeper`, `gpt-5.6-quick` | GPT-5.6 |
-| `gpt-5.4`, `gpt-5.3`, `gpt-5.2` (+ `-quick` / `-think-deeper`) | older generations |
+| `gpt-5.6-reasoning`, `gpt-5.6-chat` | GPT-5.6 |
+| `gpt-5.5-chat` | GPT-5.5 |
 | `m365-copilot-image` | image generation |
+
+Those eight are what a real work tenant offered in August 2026, and they are what
+the example configs use. Friendlier aliases (`m365-copilot`, `auto`, `quick`,
+`think-deeper`, `gpt-5.5`, …) and older generations are also mapped, as the
+pre-capture fallback.
 
 The server validates tones: an id that maps to an unknown tone fails the turn. An
 unmapped `claude-*` id routes to the Claude tone rather than silently serving GPT
@@ -136,8 +139,10 @@ when you are done and the result lands in
 ```json
 {
   "tones": {
-    "gpt-5.6-quick": "Gpt_5_6_Quick",
-    "claude-sonnet": "Claude_Sonnet"
+    "claude-sonnet": "Claude_Sonnet",
+    "gpt-5.6-reasoning": "Gpt_5_6_Reasoning",
+    "gpt-5.6-chat": "Gpt_5_6_Chat",
+    "magic": "Magic"
   },
   "surfaces": {
     "work": { "query": { "agent": "work", "scenario": "officeweb" }, "option_sets": ["..."] },
@@ -150,8 +155,8 @@ Tones sit at the top level because they are shared: the toggle changes the surfa
 around the models, not which models exist.
 
 The profile wins over the built-in defaults, and the server re-reads it when it
-changes — no restart. Model ids are derived from the tone (`Gpt_5_6_Quick` →
-`gpt-5.6-quick`); rename the keys in that file if you prefer something else. Re-run
+changes — no restart. Model ids are derived from the tone (`Gpt_5_6_Chat` →
+`gpt-5.6-chat`); rename the keys in that file if you prefer something else. Re-run
 `capture` whenever a new model shows up in the picker: it merges by default, so
 previously captured models survive.
 
@@ -288,6 +293,78 @@ called them consistently. If your tenant behaves differently, any id from
   result, each follow-up — is one message. Long sessions will hit the rotation.
 * **No file or image input.** Non-text content parts are dropped, so dragging an
   image into the chat sends only the text around it.
+
+## Using it with pi
+
+[pi](https://pi.dev) reads custom providers from `~/.pi/agent/models.json`. Copy
+[`examples/pi-models.json`](examples/pi-models.json) there:
+
+```json
+{
+  "providers": {
+    "m365": {
+      "baseUrl": "http://127.0.0.1:8765/v1",
+      "api": "openai-completions",
+      "apiKey": "unused",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "supportsUsageInStreaming": false
+      },
+      "models": [
+        {
+          "id": "claude-sonnet",
+          "name": "M365 Claude Sonnet",
+          "contextWindow": 128000,
+          "maxTokens": 16384,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "claude-sonnet-work",
+          "name": "M365 Claude Sonnet (Work IQ)",
+          "contextWindow": 128000,
+          "maxTokens": 16384,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}
+```
+
+Start the proxy, then `pi --list-models` shows the entries and `/model` picks one.
+The file reloads every time you open `/model`, so you can edit it mid-session.
+
+What the fields mean:
+
+* **`api: "openai-completions"`** — the API shape this proxy speaks.
+* **`apiKey`** — pi hides models with no auth configured, so a keyless local server
+  needs a dummy value. The proxy ignores it and authenticates to Microsoft with
+  your cached token.
+* **`cost`** — zeroed on purpose: the subscription already paid for these turns.
+* **`compat`** — not decoration, see below.
+
+### Why those `compat` flags
+
+* **`supportsDeveloperRole: false`** — for models flagged `reasoning`, pi sends the
+  system prompt under the newer `developer` role. The proxy now treats `developer`
+  as `system`, so either way works, but this is the switch pi itself documents.
+* **`supportsReasoningEffort: false`** — Copilot picks reasoning by *model*
+  (`reasoning`, `gpt-5.6-reasoning`), not by a per-request effort parameter. We
+  accept and ignore `reasoning_effort`; saying so keeps pi from showing a control
+  that does nothing.
+* **`supportsUsageInStreaming: false`** — our SSE chunks carry no `usage` payload
+  (the non-streaming response does).
+
+The models are deliberately **not** marked `reasoning: true`: nothing thinking-shaped
+ever comes back, so pi would show a thinking UI that stays empty.
+
+### Caveats
+
+Same as opencode — emulated tool calls, no incremental streaming when `tools` are
+declared, the 600-message conversation budget, and no image input. If a very long
+turn ever times out, the knobs are `httpIdleTimeoutMs` (default `300000`) and
+`retry.provider.timeoutMs` in `~/.pi/agent/settings.json`.
 
 ## Corporate TLS interception
 

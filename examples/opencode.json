@@ -12,44 +12,71 @@
       },
       "models": {
         "claude-sonnet": {
-          "name": "M365 · Claude Sonnet",
-          "limit": { "context": 128000, "output": 16384 }
-        },
-        "claude-sonnet-work": {
-          "name": "M365 · Claude Sonnet (Work IQ)",
-          "limit": { "context": 128000, "output": 16384 }
+          "name": "M365 Claude Sonnet",
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
         },
         "claude-opus": {
-          "name": "M365 · Claude Opus",
-          "limit": { "context": 128000, "output": 16384 }
+          "name": "M365 Claude Opus",
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
         },
-        "gpt-5.6-think-deeper": {
-          "name": "M365 · GPT 5.6 Reasoning",
-          "limit": { "context": 128000, "output": 16384 }
+        "gpt-5.6-reasoning": {
+          "name": "M365 GPT 5.6 Reasoning",
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
         },
-        "gpt-5.6-quick": {
-          "name": "M365 · GPT 5.6 Quick",
-          "limit": { "context": 128000, "output": 16384 }
+        "gpt-5.6-chat": {
+          "name": "M365 GPT 5.6 Chat",
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
         },
-        "gpt-5.5": {
-          "name": "M365 · GPT 5.5",
-          "limit": { "context": 128000, "output": 16384 }
+        "gpt-5.5-chat": {
+          "name": "M365 GPT 5.5 Chat",
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
         },
-        "m365-copilot": {
-          "name": "M365 · Auto",
-          "limit": { "context": 128000, "output": 16384 }
+        "magic": {
+          "name": "M365 Auto",
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
         },
-        "quick": {
-          "name": "M365 · Quick",
-          "limit": { "context": 128000, "output": 16384 }
+        "chat": {
+          "name": "M365 Quick",
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
         },
-        "think-deeper": {
-          "name": "M365 · Think Deeper",
-          "limit": { "context": 128000, "output": 16384 }
+        "reasoning": {
+          "name": "M365 Think Deeper",
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
+        },
+        "claude-sonnet-work": {
+          "name": "M365 Claude Sonnet (Work IQ)",
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
         }
       }
     }
   },
   "model": "m365/claude-sonnet",
-  "small_model": "m365/quick"
+  "small_model": "m365/chat"
 }

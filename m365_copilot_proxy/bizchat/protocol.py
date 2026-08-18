@@ -167,6 +167,20 @@ IMAGE_MODEL = "m365-copilot-image"
 #: The server VALIDATES tones: an unknown value fails the turn with
 #: "Failed to invoke 'Chat'", so only confirmed-accepted values belong here.
 MODEL_TONES: dict[str, str] = {
+    # --- Observed on a real work tenant (August 2026), by `capture`. These ids are
+    # the ones the examples use, and they are the tone slugs the client itself
+    # sends, so they are the closest thing to ground truth this map has.
+    "magic": "Magic",
+    "chat": "Chat",
+    "reasoning": "Reasoning",
+    "claude-sonnet": "Claude_Sonnet",
+    "claude-opus": "Claude_Opus",
+    "gpt-5.6-reasoning": "Gpt_5_6_Reasoning",
+    "gpt-5.6-chat": "Gpt_5_6_Chat",
+    "gpt-5.5-chat": "Gpt_5_5_Chat",
+    # --- Friendly aliases and older entries inherited from the reference
+    # implementation. They describe a different tenant at a different time, so a
+    # capture overrides them; keep them as the pre-capture fallback.
     DEFAULT_MODEL: "magic",
     "auto": "magic",
     IMAGE_MODEL: "magic",
@@ -175,20 +189,17 @@ MODEL_TONES: dict[str, str] = {
     "think-deeper": "Gpt_Reasoning",
     # Claude (genuine Anthropic models on the Copilot subscription)
     "claude": "Claude_Sonnet",
-    "claude-sonnet": "Claude_Sonnet",
     "claude-sonnet-4.5": "Claude_Sonnet",
     "claude-sonnet-think-deeper": "Claude_Sonnet_Reasoning",
-    "claude-opus": "Claude_Opus",
     # GPT-5.5 / 5.6
     "gpt-5.5": "Gpt_5_5_Chat",
     "gpt-5.5-quick": "Gpt_5_5_Chat",
     "gpt-5.5-think-deeper": "Gpt_5_5_Reasoning",
     "gpt-5.6-think-deeper": "Gpt_5_6_Reasoning",
-    # INFERRED from the naming pattern, not confirmed against a live tenant: the
-    # picker offers a 5.6 quick variant, but the reference only ever validated the
-    # reasoning one. If the server answers "Failed to invoke 'Chat'", run `capture`
-    # and let the real value replace this.
-    "gpt-5.6-quick": "Gpt_5_6_Quick",
+    # `gpt-5.6-quick` was inferred from the naming pattern and the capture DISPROVED
+    # it: the real quick variant is `gpt-5.6-chat` -> `Gpt_5_6_Chat`, above. Kept as
+    # an alias so anyone who copied the old id still lands somewhere real.
+    "gpt-5.6-quick": "Gpt_5_6_Chat",
     # Older generations, still accepted
     "gpt-5.4": "Gpt_5_4_Reasoning",
     "gpt-5.4-quick": "Gpt_5_4_Quick",

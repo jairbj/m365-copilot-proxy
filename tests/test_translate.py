@@ -110,3 +110,31 @@ def test_empty_assistant_messages_are_skipped():
     messages = [msg("user", "a"), msg("assistant", ""), msg("user", "b")]
     text = build_turn_text(messages, start_index=0, is_new_conversation=True)
     assert "Assistant:" not in text
+
+
+class TestTheDeveloperRole:
+    """OpenAI renamed `system` to `developer` for newer models, and pi sends it for
+    any model flagged as reasoning. It has to land in the system block, not loose in
+    the middle of the transcript — a coding agent keeps its tool contract there."""
+
+    def test_it_becomes_system_instructions(self):
+        messages = [msg("developer", "be terse"), msg("user", "hello")]
+        text = build_turn_text(messages, start_index=0, is_new_conversation=True)
+        assert text.startswith("[System instructions]\nbe terse")
+
+    def test_it_is_not_also_left_in_the_transcript(self):
+        messages = [msg("developer", "be terse"), msg("user", "hi"), msg("assistant", "yo"),
+                    msg("user", "again")]
+        text = build_turn_text(messages, start_index=0, is_new_conversation=True)
+        assert text.count("be terse") == 1
+
+    def test_system_and_developer_are_joined_in_order(self):
+        messages = [msg("system", "first"), msg("developer", "second"), msg("user", "hi")]
+        text = build_turn_text(messages, start_index=0, is_new_conversation=True)
+        assert "[System instructions]\nfirst\n\nsecond" in text
+
+    def test_a_resent_developer_message_is_dropped_mid_conversation(self):
+        messages = [msg("user", "a"), msg("assistant", "b"), msg("developer", "be terse"),
+                    msg("user", "c")]
+        text = build_turn_text(messages, start_index=2, is_new_conversation=False)
+        assert text == "c"

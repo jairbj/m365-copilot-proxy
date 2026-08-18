@@ -20,6 +20,12 @@ from m365_copilot_proxy.openai_api.tools import (
 
 SYSTEM_HEADER = "[System instructions]"
 
+#: OpenAI renamed `system` to `developer` for its newer models, and clients send
+#: either. Both mean the same thing to Copilot, which has neither — the text goes
+#: into the system block. Kept as one constant so the three filters below cannot
+#: drift apart and leave a system prompt loose in the middle of a transcript.
+SYSTEM_ROLES = frozenset({"system", "developer"})
+
 
 def first_user_text(messages: Sequence[ChatMessage]) -> str:
     """The text used to fingerprint the conversation."""
@@ -70,14 +76,14 @@ def build_turn_text(
     """
     if is_new_conversation:
         blocks: list[str] = []
-        system_texts = [m.text() for m in messages if m.role == "system"]
+        system_texts = [m.text() for m in messages if m.role in SYSTEM_ROLES]
         system_texts = [t for t in system_texts if t]
         if system_texts:
             blocks.append(f"{SYSTEM_HEADER}\n" + "\n\n".join(system_texts))
         if tool_instructions:
             blocks.append(tool_instructions)
 
-        conversation = [m for m in messages if m.role != "system"]
+        conversation = [m for m in messages if m.role not in SYSTEM_ROLES]
         # A single opening user message is not a transcript — sending it labelled
         # would prime Copilot to answer in transcript form.
         labelled = len(conversation) > 1
@@ -89,6 +95,6 @@ def build_turn_text(
 
     tail = list(messages)[start_index:]
     # System messages resent mid-thread are usually the client repeating itself.
-    tail = [m for m in tail if m.role != "system"]
+    tail = [m for m in tail if m.role not in SYSTEM_ROLES]
     rendered = [_render_message(m, labelled=len(tail) > 1) for m in tail]
     return "\n\n".join(r for r in rendered if r).strip()
