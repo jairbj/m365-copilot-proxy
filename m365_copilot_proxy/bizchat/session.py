@@ -152,8 +152,7 @@ class CopilotSession:
                 },
                 max_size=None,
                 open_timeout=30,
-                # `websockets` rejects an ssl argument on a plain ws:// URI.
-                ssl=tls.ssl_context() if url.startswith("wss://") else None,
+                **tls.websocket_ssl_kwargs(url),
             ) as ws:
                 try:
                     await ws.send(frames.handshake_frame())

@@ -88,6 +88,22 @@ def ssl_context() -> ssl.SSLContext | None:
     return ssl.create_default_context(cafile=bundle)
 
 
+def websocket_ssl_kwargs(url: str) -> dict[str, ssl.SSLContext]:
+    """The `ssl` keyword for `websockets.connect` — or nothing at all.
+
+    `websockets` is asymmetric about this: it refuses a non-None `ssl` argument on a
+    `ws://` URI, and it equally refuses an explicit `ssl=None` on `wss://`. Omitting
+    the key is the only form that satisfies both. On `wss://` it then defaults to
+    `ssl=True`, and asyncio builds a context with `ssl.create_default_context()` —
+    which, with the system trust store installed by `configure()`, is exactly the
+    trust we want anyway.
+    """
+    if not url.startswith("wss://"):
+        return {}
+    context = ssl_context()
+    return {"ssl": context} if context is not None else {}
+
+
 def httpx_verify() -> str | bool:
     """The `verify` argument for an httpx client."""
     return ca_bundle() or True

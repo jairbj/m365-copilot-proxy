@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from m365_copilot_proxy.bizchat.session import BizChatError, CopilotSession, TurnResult
+from m365_copilot_proxy.config import get_settings
 from tests.conftest import bind_session_to, make_token, snapshot_frame, stream_item, update_frame
 
 COMPLETION = {"type": 3, "invocationId": "0"}
@@ -206,3 +207,24 @@ async def test_generated_images_are_captured(fake_bizchat):
     # The artifact arrives repeatedly with a climbing status — one image, readiest wins.
     assert len(result.images) == 1
     assert result.images[0].status == 2
+
+
+async def test_a_wss_url_connects_without_an_ssl_argument_error(monkeypatch):
+    """`websockets` rejects an explicit ssl=None on wss:// as loudly as it rejects
+    an ssl argument on ws://. Only omitting the keyword satisfies both, so this
+    reaches a real connection attempt — against a closed local port, which fails
+    immediately and never touches the network.
+
+    The CA bundle variables are cleared deliberately: with one set there is always a
+    real context to pass, which is what hid this the first time.
+    """
+    for name in ("M365_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    get_settings.cache_clear()
+
+    session = CopilotSession()
+    session._build_url = lambda token, request_id: "wss://127.0.0.1:1/m365Copilot/Chathub/a@b"
+
+    with pytest.raises(OSError):  # connection refused, NOT ValueError
+        async for _ in session.chat(token=make_token(), text="hello"):
+            pass

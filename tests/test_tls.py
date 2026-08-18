@@ -70,6 +70,27 @@ class TestClientArguments:
             tls.ssl_context()
 
 
+class TestWebSocketSslKwargs:
+    """`websockets` refuses an ssl argument on ws:// AND an explicit ssl=None on
+    wss://, so the only thing that works for both is omitting the key."""
+
+    def test_a_plain_ws_url_gets_no_ssl_argument(self, monkeypatch, bundle):
+        assert tls.websocket_ssl_kwargs("ws://127.0.0.1:1234/chat") == {}
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(bundle))
+        assert tls.websocket_ssl_kwargs("ws://127.0.0.1:1234/chat") == {}
+
+    def test_wss_without_a_bundle_omits_the_key_entirely(self):
+        # Not {"ssl": None} — that is rejected just as hard as passing one on ws://.
+        assert tls.websocket_ssl_kwargs("wss://substrate.office.com/x") == {}
+
+    def test_wss_with_a_bundle_passes_the_context(self, monkeypatch):
+        import certifi
+
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", certifi.where())
+        kwargs = tls.websocket_ssl_kwargs("wss://substrate.office.com/x")
+        assert isinstance(kwargs["ssl"], ssl.SSLContext)
+
+
 class TestExplainSslError:
     def test_a_certificate_failure_is_explained(self):
         exc = ssl.SSLCertVerificationError("certificate verify failed")
