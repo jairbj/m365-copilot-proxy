@@ -27,24 +27,35 @@ def chat_frame(tone: str, **extra) -> str:
 
 
 class TestNoteUrl:
-    def test_the_tenant_surface_is_recorded(self):
+    def test_the_url_names_the_surface_it_belongs_to(self):
+        # No flag to remember: the `agent` field says which side of the Work IQ
+        # toggle this capture is recording.
         collector = ProfileCollector()
-        assert collector.note_url(CHATHUB_URL) is True
-        assert collector.query["agent"] == "work"
-        assert collector.query["scenario"] == "officeweb"
-        assert collector.query["licenseType"] == "Premium"
-        assert collector.query["variants"] == "feature.a,feature.b"
+        assert collector.note_url(CHATHUB_URL) == "work"
+
+        surface = collector.surfaces["work"]
+        assert surface.query["scenario"] == "officeweb"
+        assert surface.query["licenseType"] == "Premium"
+        assert surface.query["variants"] == "feature.a,feature.b"
+
+    def test_two_runs_fill_two_surfaces(self):
+        collector = ProfileCollector()
+        collector.note_url(CHATHUB_URL, socket_id=1)
+        collector.note_url(CHATHUB_URL.replace("agent=work", "agent=web"), socket_id=2)
+
+        assert set(collector.surfaces) == {"work", "web"}
+        assert collector.surfaces["web"].query["agent"] == "web"
 
     def test_the_access_token_is_never_recorded(self):
         collector = ProfileCollector()
         collector.note_url(CHATHUB_URL)
         assert "SECRET-TOKEN" not in json.dumps(collector.build().to_json())
-        assert "access_token" not in collector.query
+        assert "access_token" not in collector.surfaces["work"].query
 
     def test_unrelated_sockets_are_ignored(self):
         collector = ProfileCollector()
-        assert collector.note_url("wss://example.invalid/telemetry?agent=nonsense") is False
-        assert collector.query == {}
+        assert collector.note_url("wss://example.invalid/telemetry?agent=nonsense") is None
+        assert collector.surfaces == {}
 
 
 class TestNoteFramePayload:
@@ -78,18 +89,32 @@ class TestNoteFramePayload:
         collector.note_frame_payload(1, whole[:10])
         assert collector.note_frame_payload(2, whole) == ["Claude_Opus"]
 
-    def test_option_sets_and_allowed_types_are_captured(self):
+    def test_option_sets_plugins_and_types_land_on_the_socket_surface(self):
         collector = ProfileCollector()
+        collector.note_url(CHATHUB_URL, socket_id=1)
         collector.note_frame_payload(
             1,
             chat_frame(
                 "magic",
                 optionsSets=["tenant_set_a", "tenant_set_b"],
                 allowedMessageTypes=["Chat", "Progress"],
+                plugins=[{"Id": "BingWebSearch", "Source": "BuiltIn"}],
             ),
         )
-        assert collector.option_sets == ["tenant_set_a", "tenant_set_b"]
-        assert collector.allowed_message_types == ["Chat", "Progress"]
+        surface = collector.surfaces["work"]
+        assert surface.option_sets == ["tenant_set_a", "tenant_set_b"]
+        assert surface.allowed_message_types == ["Chat", "Progress"]
+        assert surface.plugins == [{"Id": "BingWebSearch", "Source": "BuiltIn"}]
+
+    def test_frames_from_different_surfaces_do_not_mix(self):
+        collector = ProfileCollector()
+        collector.note_url(CHATHUB_URL, socket_id=1)
+        collector.note_url(CHATHUB_URL.replace("agent=work", "agent=web"), socket_id=2)
+        collector.note_frame_payload(1, chat_frame("magic", optionsSets=["enterprise_flux_work"]))
+        collector.note_frame_payload(2, chat_frame("magic", optionsSets=["cwc_flux_v3"]))
+
+        assert collector.surfaces["work"].option_sets == ["enterprise_flux_work"]
+        assert collector.surfaces["web"].option_sets == ["cwc_flux_v3"]
 
     def test_non_chat_frames_are_ignored(self):
         collector = ProfileCollector()
@@ -104,10 +129,11 @@ class TestNoteFramePayload:
 
 def test_build_produces_a_saveable_profile():
     collector = ProfileCollector()
-    collector.note_url(CHATHUB_URL)
+    collector.note_url(CHATHUB_URL, socket_id=1)
     collector.note_frame_payload(1, chat_frame("Claude_Sonnet"))
 
     profile = collector.build()
     assert profile.is_empty is False
+    # Tones are shared, surfaces are not.
     assert profile.tones == {"claude-sonnet": "Claude_Sonnet"}
-    assert profile.query["agent"] == "work"
+    assert profile.surfaces["work"].query["agent"] == "work"

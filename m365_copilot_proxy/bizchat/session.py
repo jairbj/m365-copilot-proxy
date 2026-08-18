@@ -85,7 +85,7 @@ class CopilotSession:
         self.messages_used = 0
         log.info("Rotated to a new conversation: cid=%s", self.conversation_id)
 
-    def _build_url(self, token: str, request_id: str) -> str:
+    def _build_url(self, token: str, request_id: str, work_iq: bool | None = None) -> str:
         claims = decode_jwt(token)
         query = {
             "chatsessionid": request_id,
@@ -93,8 +93,8 @@ class CopilotSession:
             "X-SessionId": self.session_id,
             "ConversationId": self.conversation_id,
             "access_token": token,
-            "variants": protocol.variants(),
-            **protocol.query_defaults(),
+            "variants": protocol.variants(work_iq),
+            **protocol.query_defaults(work_iq),
         }
         return (
             f"wss://{protocol.WS_HOST}{protocol.WS_PATH}/"
@@ -108,6 +108,7 @@ class CopilotSession:
         text: str,
         model: str = protocol.DEFAULT_MODEL,
         generate_images: bool = False,
+        work_iq: bool | None = None,
         result: TurnResult | None = None,
     ) -> AsyncIterator[str]:
         """Send one turn and yield the answer incrementally.
@@ -121,14 +122,20 @@ class CopilotSession:
         is_first = self.turn_count == 0
         self.turn_count += 1
 
-        options_sets = protocol.option_sets(generate_images=generate_images)
-        allowed = protocol.allowed_message_types(generate_images=generate_images)
+        options_sets = protocol.option_sets(work_iq=work_iq, generate_images=generate_images)
+        allowed = protocol.allowed_message_types(
+            work_iq=work_iq, generate_images=generate_images
+        )
+        plugin_list = protocol.plugins(work_iq)
 
-        url = self._build_url(token, request_id)
+        url = self._build_url(token, request_id, work_iq)
+        # The surface is in the log because "why did this answer not find my email"
+        # is exactly the question it answers.
         log.info(
-            "Turn %d: model=%s cid=%s images=%s",
+            "Turn %d: model=%s surface=%s cid=%s images=%s",
             self.turn_count,
             model,
+            protocol.query_defaults(work_iq).get("agent"),
             self.conversation_id,
             generate_images,
         )
@@ -195,6 +202,7 @@ class CopilotSession:
                                     is_first=is_first,
                                     options_sets=options_sets,
                                     allowed=allowed,
+                                    plugin_list=plugin_list,
                                 )
                                 continue
 
@@ -274,6 +282,7 @@ class CopilotSession:
         is_first: bool,
         options_sets: list[str],
         allowed: list[str],
+        plugin_list: list[dict[str, Any]] | None = None,
     ) -> None:
         """Send the chat invocation and its mandatory Metrics companion."""
         chat = frames.build_chat_invocation(
@@ -284,6 +293,7 @@ class CopilotSession:
             tone=protocol.tone_for_model(model),
             options_sets=options_sets,
             allowed_message_types=allowed,
+            plugin_list=plugin_list,
         )
         metrics = frames.build_metrics()
         self._dump(request_id, "send", chat)

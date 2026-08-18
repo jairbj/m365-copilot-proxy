@@ -91,6 +91,7 @@ def build_chat_invocation(
     tone: str,
     options_sets: list[str] | None = None,
     allowed_message_types: list[str] | None = None,
+    plugin_list: list[dict[str, Any]] | None = None,
     locale: str = "en-us",
     time_zone: str = "UTC",
 ) -> dict[str, Any]:
@@ -129,7 +130,11 @@ def build_chat_invocation(
                     "adaptiveCards": [],
                     "clientPreferences": {},
                 },
-                "plugins": [dict(protocol.BING_PLUGIN)],
+                "plugins": (
+                    [dict(p) for p in plugin_list]
+                    if plugin_list is not None
+                    else [dict(protocol.BING_PLUGIN)]
+                ),
                 "isSbsSupported": True,
                 "tone": tone,
                 "renderReferencesBehindEOS": True,

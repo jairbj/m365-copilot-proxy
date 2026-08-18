@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     conversation_turn_headroom: int = 10
     #: Enable image generation on every turn instead of only for the image model id.
     images_always: bool = False
+    #: Ground answers in the tenant's work content (the web client's "Work IQ"
+    #: toggle) when the model id does not say. Off by default: it costs latency,
+    #: and company content should not enter a conversation unasked. Turn it on per
+    #: request with the `-work` model suffix.
+    work_iq: bool = False
     #: Append NDJSON of every SignalR frame to `<config_dir>/frames/<id>.ndjson`.
     dump_frames: bool = False
     log_level: str = "INFO"

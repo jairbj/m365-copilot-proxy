@@ -1,13 +1,19 @@
 """The tenant profile: what the real web client sends, learned from the browser.
 
 Every wire constant in `protocol.py` is a snapshot of one tenant at one moment —
-the surface (`agent`/`scenario`/`licenseType`), the feature `variants`, and above
-all the `tone` values that select a model. Microsoft changes all of them, and they
-differ between an individual, an education and a work tenant. A wrong `tone` is not
-a soft failure: the server rejects the turn outright.
+the licence surface, the feature `variants`, the `optionsSets`, and above all the
+`tone` values that select a model. Microsoft changes all of them, and they differ
+between an individual, an education and a work tenant. A wrong `tone` is not a soft
+failure: the server rejects the turn outright.
 
-So rather than guessing, `m365-copilot-proxy capture` watches the real chat client
-and writes what it actually sends here. This module is the reader: when a profile
+The web client also has more than one shape at a time. The "Work IQ" toggle does
+not flip a single field — it swaps a whole surface: `agent`, `scenario`, the
+`variants` string and the entire `optionsSets` family all change together
+(`enterprise_*` with work grounding on, `cwc_*` with it off). So a profile holds one
+entry per surface, and the proxy serves whichever the caller asked for rather than
+mixing fields from both.
+
+`m365-copilot-proxy capture` writes this file; this module reads it. When a profile
 exists it wins over the built-in defaults, and when it does not, nothing changes.
 """
 
@@ -27,6 +33,10 @@ log = logging.getLogger(__name__)
 
 PROFILE_FILENAME = "profile.json"
 
+#: The two surfaces, named by the `agent` query field that identifies them.
+WORK = "work"
+WEB = "web"
+
 #: Query-string fields worth learning. `access_token` is deliberately absent — it
 #: is a credential, it is per-connection, and it must never reach the profile.
 CAPTURED_QUERY_KEYS = (
@@ -42,26 +52,84 @@ CAPTURED_QUERY_KEYS = (
 
 
 @dataclass
-class TenantProfile:
-    """What the real client was observed sending."""
+class Surface:
+    """One complete shape of the client: everything that changes as a unit."""
 
     query: dict[str, str] = field(default_factory=dict)
-    tones: dict[str, str] = field(default_factory=dict)
     option_sets: list[str] = field(default_factory=list)
     allowed_message_types: list[str] = field(default_factory=list)
+    #: None means the capture never saw them; [] means it saw none.
+    plugins: list[dict[str, Any]] | None = None
+
+    @property
+    def is_empty(self) -> bool:
+        return not (
+            self.query
+            or self.option_sets
+            or self.allowed_message_types
+            or self.plugins is not None
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "query": self.query,
+            "option_sets": self.option_sets,
+            "allowed_message_types": self.allowed_message_types,
+            "plugins": self.plugins,
+        }
+
+    @classmethod
+    def from_json(cls, data: Any) -> Surface:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            query=_string_map(data.get("query")),
+            option_sets=_string_list(data.get("option_sets")),
+            allowed_message_types=_string_list(data.get("allowed_message_types")),
+            plugins=(
+                [p for p in raw_plugins if isinstance(p, dict)]
+                if isinstance(raw_plugins := data.get("plugins"), list)
+                else None
+            ),
+        )
+
+
+@dataclass
+class TenantProfile:
+    """What the real client was observed sending, per surface."""
+
+    #: Surface name (`work` / `web`) -> what that surface sends.
+    surfaces: dict[str, Surface] = field(default_factory=dict)
+    #: Model tones are a choice of model, not of surface, so they are shared.
+    tones: dict[str, str] = field(default_factory=dict)
     captured_at: str | None = None
 
     @property
     def is_empty(self) -> bool:
-        return not (self.query or self.tones or self.option_sets)
+        return not (self.tones or any(not s.is_empty for s in self.surfaces.values()))
+
+    def surface_for(self, name: str) -> Surface | None:
+        """The requested surface, or the only one we have, or None.
+
+        Falling back to the other surface is deliberate: half a profile is still
+        better than the inherited defaults, which describe a different tenant
+        entirely. The caller logs the substitution so it is never silent.
+        """
+        exact = self.surfaces.get(name)
+        if exact is not None and not exact.is_empty:
+            return exact
+        usable = [s for s in self.surfaces.values() if not s.is_empty]
+        return usable[0] if len(usable) == 1 else None
+
+    def has_surface(self, name: str) -> bool:
+        surface = self.surfaces.get(name)
+        return surface is not None and not surface.is_empty
 
     def to_json(self) -> dict[str, Any]:
         return {
             "captured_at": self.captured_at or datetime.now(tz=UTC).isoformat(),
-            "query": self.query,
             "tones": self.tones,
-            "option_sets": self.option_sets,
-            "allowed_message_types": self.allowed_message_types,
+            "surfaces": {name: s.to_json() for name, s in self.surfaces.items()},
         }
 
     @classmethod
@@ -69,11 +137,23 @@ class TenantProfile:
         if not isinstance(data, dict):
             raise ValueError("profile must be a JSON object")
         captured_at = data.get("captured_at")
+        surfaces: dict[str, Surface] = {}
+
+        raw_surfaces = data.get("surfaces")
+        if isinstance(raw_surfaces, dict):
+            for name, raw in raw_surfaces.items():
+                if isinstance(name, str):
+                    surfaces[name] = Surface.from_json(raw)
+        elif any(k in data for k in ("query", "option_sets", "allowed_message_types", "plugins")):
+            # A profile captured before surfaces existed. It described whichever
+            # surface the toggle happened to be in, and the `agent` field says
+            # which — so it migrates itself into the right slot.
+            legacy = Surface.from_json(data)
+            surfaces[legacy.query.get("agent", WEB)] = legacy
+
         return cls(
-            query=_string_map(data.get("query")),
+            surfaces=surfaces,
             tones=_string_map(data.get("tones")),
-            option_sets=_string_list(data.get("option_sets")),
-            allowed_message_types=_string_list(data.get("allowed_message_types")),
             captured_at=captured_at if isinstance(captured_at, str) else None,
         )
 
@@ -124,8 +204,8 @@ def load() -> TenantProfile:
         profile = TenantProfile()
     else:
         log.info(
-            "Loaded tenant profile: %d query fields, %d tones (captured %s)",
-            len(profile.query),
+            "Loaded tenant profile: surfaces=%s, %d tones (captured %s)",
+            sorted(name for name in profile.surfaces if profile.has_surface(name)),
             len(profile.tones),
             profile.captured_at,
         )

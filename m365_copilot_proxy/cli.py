@@ -112,10 +112,10 @@ def doctor() -> None:
 @cli.command()
 def capture(
     merge: bool = typer.Option(
-        True, help="Keep tones from a previous capture that this run did not see."
+        True, help="Keep tones and surfaces from previous captures this run did not see."
     ),
 ) -> None:
-    """Learn this tenant's models and surface by watching the real Copilot UI."""
+    """Learn this tenant's models and surfaces by watching the real Copilot UI."""
     from m365_copilot_proxy.bizchat import profile as tenant_profile
     from m365_copilot_proxy.capture import ProfileCollector
     from m365_copilot_proxy.capture import run as run_capture
@@ -123,9 +123,11 @@ def capture(
     _setup_logging()
     collector = ProfileCollector()
     if merge:
+        # Each run records the surface the Work IQ toggle is currently in, so
+        # merging is what lets two runs build one complete profile.
         previous = tenant_profile.load()
         collector.tones.update(previous.tones)
-        collector.query.update(previous.query)
+        collector.surfaces.update(previous.surfaces)
 
     try:
         asyncio.run(run_capture(collector))
@@ -146,17 +148,28 @@ def capture(
 
     path = tenant_profile.save(captured)
     typer.echo(f"\nSaved {path}")
-    if captured.query:
-        surface = {
-            key: captured.query[key]
+
+    for name, surface in sorted(captured.surfaces.items()):
+        summary = {
+            key: surface.query[key]
             for key in ("agent", "scenario", "licenseType")
-            if key in captured.query
+            if key in surface.query
         }
-        typer.echo(f"Surface: {surface}")
+        typer.echo(f"Surface {name}: {summary} ({len(surface.option_sets)} optionsSets)")
+
+    missing = {tenant_profile.WORK, tenant_profile.WEB} - set(captured.surfaces)
+    for name in sorted(missing):
+        typer.secho(
+            f"No '{name}' surface yet — run capture again with Work IQ "
+            f"{'on' if name == tenant_profile.WORK else 'off'} to record it.",
+            fg=typer.colors.YELLOW,
+        )
+
     typer.echo(f"Models ({len(captured.tones)}):")
     for model_id, tone in sorted(captured.tones.items()):
         typer.echo(f"  {model_id:<28} tone={tone}")
     typer.echo("\nRename the ids in that file if you prefer different model names.")
+    typer.echo("Add `-work` to any id to ground that turn in your work content.")
 
 
 @cli.command()

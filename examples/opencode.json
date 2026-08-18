@@ -15,6 +15,10 @@
           "name": "M365 · Claude Sonnet",
           "limit": { "context": 128000, "output": 16384 }
         },
+        "claude-sonnet-work": {
+          "name": "M365 · Claude Sonnet (Work IQ)",
+          "limit": { "context": 128000, "output": 16384 }
+        },
         "claude-opus": {
           "name": "M365 · Claude Opus",
           "limit": { "context": 128000, "output": 16384 }

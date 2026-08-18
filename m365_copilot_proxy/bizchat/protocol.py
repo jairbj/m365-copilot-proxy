@@ -14,7 +14,11 @@ use rather than reading the constants directly.
 
 from __future__ import annotations
 
+import logging
+
 from m365_copilot_proxy.bizchat import profile as tenant_profile
+
+log = logging.getLogger(__name__)
 
 WS_HOST = "substrate.office.com"
 WS_PATH = "/m365Copilot/Chathub"
@@ -70,6 +74,18 @@ VARIANTS = [
     "feature.MacOutlookHubToHelix",
     "Agt_bizchat_enableGpt5ForHelix",
 ]
+
+#: The `agent` field names the surface. It is the visible half of the "Work IQ"
+#: toggle in the web client: with work grounding on the client sends `work` (plus a
+#: matching `scenario`, `variants` and `enterprise_*` optionsSets), and with it off
+#: it sends `web` (with the consumer `cwc_*` family instead). The rest of the
+#: surface is learned by `capture`, not hard-coded.
+AGENT_WORK = "work"
+AGENT_WEB = "web"
+
+#: Model id suffixes selecting the surface per request.
+WORK_SUFFIX = "-work"
+WEB_SUFFIX = "-web"
 
 #: Static query-string fields identifying the client surface.
 QUERY_DEFAULTS = {
@@ -197,45 +213,124 @@ def model_tones() -> dict[str, str]:
     return {**MODEL_TONES, **tenant_profile.load().tones}
 
 
-def query_defaults() -> dict[str, str]:
-    """Static WebSocket query fields, preferring the captured tenant surface.
+def surface_name(work_iq: bool | None) -> str:
+    """Which captured surface a Work IQ choice corresponds to.
 
-    This is where a work/enterprise tenant diverges from the individual one
-    (`agent=work`, `scenario=officeweb`, `licenseType=Premium`), which is exactly
-    the kind of thing that is not worth guessing.
+    `None` means "whatever the configuration says", which is off unless the user
+    turned it on. Resolving it here rather than at each call site is what keeps a
+    caller from silently grounding a turn in work content by leaving the argument
+    out.
     """
-    captured = tenant_profile.load().query
+    from m365_copilot_proxy.config import get_settings
+
+    wants_work = get_settings().work_iq if work_iq is None else work_iq
+    return tenant_profile.WORK if wants_work else tenant_profile.WEB
+
+
+def _surface(work_iq: bool | None) -> tenant_profile.Surface | None:
+    """The captured surface to serve, warning when we have to substitute.
+
+    Work IQ swaps the whole client shape, not one field, so mixing the `agent` of
+    one surface with the `optionsSets` of the other would send a combination no real
+    client sends. Better to serve the surface we have and say so.
+    """
+    wanted = surface_name(work_iq)
+    profile = tenant_profile.load()
+    if profile.has_surface(wanted):
+        return profile.surfaces[wanted]
+
+    substitute = profile.surface_for(wanted)
+    if substitute is not None:
+        log.warning(
+            "No captured '%s' surface — using the '%s' one instead. Run `capture` "
+            "with Work IQ %s in the chat window to record it.",
+            wanted,
+            substitute.query.get("agent", "?"),
+            "on" if wanted == tenant_profile.WORK else "off",
+        )
+    return substitute
+
+
+def query_defaults(work_iq: bool | None = None) -> dict[str, str]:
+    """Static WebSocket query fields for the requested surface.
+
+    This is where a work tenant diverges from an individual one, and where Work IQ
+    on diverges from off (`agent`, `scenario`, and the whole `variants` string) —
+    exactly the kind of thing that is not worth guessing.
+    """
+    captured = (_surface(work_iq) or tenant_profile.Surface()).query
     merged = dict(QUERY_DEFAULTS)
-    for key in QUERY_DEFAULTS:
+    for key in (*QUERY_DEFAULTS, "isEdu"):
         if key in captured:
             merged[key] = captured[key]
-    if "isEdu" in captured:
-        merged["isEdu"] = captured["isEdu"]
+    if not captured:
+        # Nothing captured yet: the agent field is the one part of the surface we
+        # can set from knowledge alone.
+        merged["agent"] = (
+            AGENT_WORK if surface_name(work_iq) == tenant_profile.WORK else AGENT_WEB
+        )
     return merged
 
 
-def variants() -> str:
-    """The comma-separated feature variants, captured if available."""
-    captured = tenant_profile.load().query.get("variants")
+def variants(work_iq: bool | None = None) -> str:
+    """The comma-separated feature variants for the requested surface."""
+    surface = _surface(work_iq)
+    captured = surface.query.get("variants") if surface else None
     return captured if captured else ",".join(VARIANTS)
 
 
-def option_sets(*, generate_images: bool = False) -> list[str]:
-    """The optionsSets to send, captured if available."""
-    captured = tenant_profile.load().option_sets
+def option_sets(*, work_iq: bool | None = None, generate_images: bool = False) -> list[str]:
+    """The optionsSets to send for the requested surface."""
+    surface = _surface(work_iq)
+    captured = surface.option_sets if surface else []
     sets = list(captured) if captured else list(CODE_INTERPRETER_OPTIONS_SETS)
     if generate_images:
         sets += [s for s in IMAGE_GEN_OPTIONS_SETS if s not in sets]
     return sets
 
 
-def allowed_message_types(*, generate_images: bool = False) -> list[str]:
-    """The message types we declare we can handle, captured if available."""
-    captured = tenant_profile.load().allowed_message_types
+def allowed_message_types(
+    *, work_iq: bool | None = None, generate_images: bool = False
+) -> list[str]:
+    """The message types we declare we can handle for the requested surface."""
+    surface = _surface(work_iq)
+    captured = surface.allowed_message_types if surface else []
     types = list(captured) if captured else list(ALLOWED_MESSAGE_TYPES)
     if generate_images and IMAGE_MESSAGE_TYPE not in types:
         types.append(IMAGE_MESSAGE_TYPE)
     return types
+
+
+def plugins(work_iq: bool | None = None) -> list[dict[str, str]]:
+    """The plugin list for the requested surface, captured if available.
+
+    An empty captured list means "this surface sends no plugins" and is honoured;
+    only a surface that never recorded them (`None`) falls back to the built-in.
+    """
+    surface = _surface(work_iq)
+    if surface is not None and surface.plugins is not None:
+        return [dict(p) for p in surface.plugins]
+    return [dict(BING_PLUGIN)]
+
+
+def parse_model(model: str | None) -> tuple[str, bool | None]:
+    """Split a model id into its base and an explicit Work IQ choice.
+
+    `claude-sonnet-work` -> ("claude-sonnet", True)
+    `claude-sonnet-web`  -> ("claude-sonnet", False)
+    `claude-sonnet`      -> ("claude-sonnet", None), meaning "caller's default"
+
+    A model id that actually exists is never split: if Microsoft ever ships a tone
+    whose slug ends in `-work`, the real model wins over the suffix convention.
+    """
+    if not model:
+        return "", None
+    if model in model_tones():
+        return model, None
+    for suffix, work_iq in ((WORK_SUFFIX, True), (WEB_SUFFIX, False)):
+        if model.endswith(suffix) and len(model) > len(suffix):
+            return model[: -len(suffix)], work_iq
+    return model, None
 
 
 def tone_for_model(model: str | None) -> str:
@@ -258,4 +353,10 @@ def tone_for_model(model: str | None) -> str:
 
 
 def available_models() -> list[str]:
-    return list(model_tones())
+    """Every model id, each also offered with the Work IQ suffix.
+
+    The `-web` suffix is accepted on input but not advertised — it would be a third
+    copy of the list saying what the default already says.
+    """
+    base = list(model_tones())
+    return base + [f"{name}{WORK_SUFFIX}" for name in base]

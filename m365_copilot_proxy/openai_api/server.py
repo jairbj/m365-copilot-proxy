@@ -129,8 +129,15 @@ async def run_completion(body: ChatCompletionRequest) -> object:
     settings = get_settings()
     token = await get_chat_token()
 
+    # The model id carries the surface choice as a suffix; strip it before the
+    # tone lookup, or `gpt-5.5-work` would silently fall back to the default tone.
+    base_model, requested_work_iq = protocol.parse_model(body.model)
+    work_iq = requested_work_iq if requested_work_iq is not None else settings.work_iq
+
+    # Keyed on the RAW id, so `claude-sonnet` and `claude-sonnet-work` become
+    # separate BizChat conversations instead of one that changes surface midway.
     key = conversation_key(body.model, first_user_text(body.messages))
-    generate_images = body.model == protocol.IMAGE_MODEL or settings.images_always
+    generate_images = base_model == protocol.IMAGE_MODEL or settings.images_always
     # With tools declared we cannot stream: a tool call is only recognisable once
     # the fenced block is complete, and half a block must never reach the client.
     buffered = bool(body.tools)
@@ -156,8 +163,9 @@ async def run_completion(body: ChatCompletionRequest) -> object:
         stream = turn.session.chat(
             token=token,
             text=text,
-            model=body.model,
+            model=base_model,
             generate_images=generate_images,
+            work_iq=work_iq,
             result=result,
         )
 

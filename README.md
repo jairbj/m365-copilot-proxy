@@ -128,18 +128,26 @@ invocation, which carries the `tone` behind the entry you picked in the model
 selector.
 
 So: **pick a model, send any short message, wait for the reply to start, repeat.**
-Each new tone is printed as it is seen. Close the window when you are done and the
-result lands in `~/.config/m365-copilot-proxy/profile.json`:
+Each new tone is printed as it is seen. Run it once with Work IQ on and once with it
+off to record both surfaces (see below) — each run keeps the other. Close the window
+when you are done and the result lands in
+`~/.config/m365-copilot-proxy/profile.json`:
 
 ```json
 {
-  "query": { "agent": "work", "scenario": "officeweb", "licenseType": "Premium" },
   "tones": {
     "gpt-5.6-quick": "Gpt_5_6_Quick",
     "claude-sonnet": "Claude_Sonnet"
+  },
+  "surfaces": {
+    "work": { "query": { "agent": "work", "scenario": "officeweb" }, "option_sets": ["..."] },
+    "web":  { "query": { "agent": "web", "scenario": "OfficeWebPaidCopilot" }, "option_sets": ["..."] }
   }
 }
 ```
+
+Tones sit at the top level because they are shared: the toggle changes the surface
+around the models, not which models exist.
 
 The profile wins over the built-in defaults, and the server re-reads it when it
 changes — no restart. Model ids are derived from the tone (`Gpt_5_6_Quick` →
@@ -149,6 +157,49 @@ previously captured models survive.
 
 The access token is never recorded — it lives in the WebSocket URL, and `capture`
 reads every field except that one.
+
+### Work IQ: grounding in your work content
+
+The web client has a "Work IQ" toggle that decides whether Copilot searches your
+tenant — mail, files, Teams. Here it is a **model suffix**:
+
+```bash
+claude-sonnet        # default: no work grounding
+claude-sonnet-work   # searches your work content
+claude-sonnet-web    # explicitly off (same as no suffix, by default)
+```
+
+Any model id takes the suffix, and `GET /v1/models` lists both variants so it shows
+up in a client's model picker. `M365_WORK_IQ=1` flips the default for ids without a
+suffix.
+
+**Off by default**, because it costs latency, it can derail a coding task with a
+search nobody asked for, and company content should not enter a conversation
+unasked.
+
+Under the hood the toggle is not one field — it is a whole surface. Captured from a
+real tenant, with everything below changing together:
+
+| | Work IQ on | Work IQ off |
+| --- | --- | --- |
+| `agent` | `work` | `web` |
+| `scenario` | `officeweb` | `OfficeWebPaidCopilot` |
+| `optionsSets` | `enterprise_*` family | `cwc_*` family |
+| `variants` | one list | a different one |
+
+So `capture` stores one **surface** per toggle state, and a turn serves one of them
+whole. Run it twice — once with Work IQ on, once with it off — and each run files
+itself under the `agent` it observes, keeping the other. With only one surface
+captured the proxy uses it for both and says so in the log, rather than mixing
+fields from the two, which would produce a combination no real client sends and
+that the server accepts in silence.
+
+A thread cannot change surface midway, so `claude-sonnet` and `claude-sonnet-work`
+become separate Copilot conversations even with identical history.
+
+> If you captured a profile before this existed, it migrates into whichever slot
+> its `agent` names. A profile captured with Work IQ on was pinning every request
+> to work grounding; after upgrading, the default becomes off.
 
 ### Tool calling
 
@@ -321,6 +372,7 @@ Everything is settable through `M365_*` environment variables or a `.env` file:
 | `M365_SESSION_IDLE_TIMEOUT` | `1800` | Idle seconds before a conversation is evicted |
 | `M365_OUTPUT_CHAR_CEILING` | `12000` | Report `finish_reason: "length"` above this; `0` disables |
 | `M365_IMAGES_ALWAYS` | `false` | Enable image generation on every turn |
+| `M365_WORK_IQ` | `false` | Ground answers in work content by default |
 | `M365_DUMP_FRAMES` | `false` | Write every SignalR frame to `<config_dir>/frames/` |
 | `M365_LOG_LEVEL` | `INFO` | Logging level |
 

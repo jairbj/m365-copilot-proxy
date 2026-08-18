@@ -110,8 +110,8 @@ def bind_session_to(session: Any, fake: FakeBizChat) -> None:
     """
     from m365_copilot_proxy.bizchat.session import CopilotSession
 
-    def build(token: str, request_id: str) -> str:
-        url = CopilotSession._build_url(session, token, request_id)
+    def build(token: str, request_id: str, work_iq: bool | None = None) -> str:
+        url = CopilotSession._build_url(session, token, request_id, work_iq)
         return url.replace("wss://substrate.office.com", f"ws://127.0.0.1:{fake.port}")
 
     session._build_url = build  # type: ignore[method-assign]

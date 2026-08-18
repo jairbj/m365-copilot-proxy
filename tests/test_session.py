@@ -169,6 +169,16 @@ async def test_the_first_turn_is_marked_as_the_start_of_the_session(fake_bizchat
     assert fake2.chat_arguments["isStartOfSession"] is False
 
 
+async def test_work_iq_selects_the_surface_on_the_wire(fake_bizchat):
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    await run_turn(fake, work_iq=True)
+    assert parse_qs(urlparse(fake.urls[0]).query)["agent"] == ["work"]
+
+    fake2 = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    await run_turn(fake2, work_iq=False)
+    assert parse_qs(urlparse(fake2.urls[0]).query)["agent"] == ["web"]
+
+
 async def test_the_model_selects_the_tone(fake_bizchat):
     fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
     await run_turn(fake, model="claude-sonnet")
@@ -223,7 +233,9 @@ async def test_a_wss_url_connects_without_an_ssl_argument_error(monkeypatch):
     get_settings.cache_clear()
 
     session = CopilotSession()
-    session._build_url = lambda token, request_id: "wss://127.0.0.1:1/m365Copilot/Chathub/a@b"
+    session._build_url = (
+        lambda token, request_id, work_iq=None: "wss://127.0.0.1:1/m365Copilot/Chathub/a@b"
+    )
 
     with pytest.raises(OSError):  # connection refused, NOT ValueError
         async for _ in session.chat(token=make_token(), text="hello"):

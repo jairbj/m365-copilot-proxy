@@ -22,6 +22,8 @@ from urllib.parse import parse_qs, urlparse
 from m365_copilot_proxy.bizchat import frames, protocol
 from m365_copilot_proxy.bizchat.profile import (
     CAPTURED_QUERY_KEYS,
+    WEB,
+    Surface,
     TenantProfile,
     slug_for_tone,
 )
@@ -42,34 +44,47 @@ def _notice(message: str) -> None:
 
 @dataclass
 class ProfileCollector:
-    """Accumulates observations. Owned by the caller so a Ctrl-C still saves."""
+    """Accumulates observations. Owned by the caller so a Ctrl-C still saves.
 
-    query: dict[str, str] = field(default_factory=dict)
+    Observations are filed per surface, because the "Work IQ" toggle swaps the whole
+    client shape at once — `agent`, `scenario`, `variants` and the entire
+    `optionsSets` family. The surface names itself: the `agent` field of the
+    connection URL says which one this is, so running capture once per toggle state
+    fills both slots with no flag to remember.
+    """
+
+    surfaces: dict[str, Surface] = field(default_factory=dict)
+    #: Tones are shared: the toggle changes the surface, not which models exist.
     tones: dict[str, str] = field(default_factory=dict)
-    option_sets: list[str] = field(default_factory=list)
-    allowed_message_types: list[str] = field(default_factory=list)
     #: Per-socket leftovers, since a frame can straddle two WebSocket messages.
     _buffers: dict[int, str] = field(default_factory=dict, repr=False)
+    #: Which surface each live socket belongs to.
+    _socket_surface: dict[int, str] = field(default_factory=dict, repr=False)
 
     @property
     def observations(self) -> int:
         return len(self.tones)
 
-    def note_url(self, url: str) -> bool:
-        """Record the query fields of a Chathub URL. Returns True if it was one.
+    def note_url(self, url: str, socket_id: int = 0) -> str | None:
+        """Record a Chathub URL's query fields. Returns the surface, or None.
 
         `access_token` is never read: it is a credential, it is per-connection, and
         it has no business being written to a config file.
         """
         parsed = urlparse(url)
         if protocol.WS_PATH.lower() not in parsed.path.lower():
-            return False
+            return None
         params = parse_qs(parsed.query)
-        for key in CAPTURED_QUERY_KEYS:
-            values = params.get(key)
-            if values and values[0]:
-                self.query[key] = values[0]
-        return True
+        captured = {
+            key: values[0]
+            for key in CAPTURED_QUERY_KEYS
+            if (values := params.get(key)) and values[0]
+        }
+        name = captured.get("agent", WEB)
+        surface = self.surfaces.setdefault(name, Surface())
+        surface.query.update(captured)
+        self._socket_surface[socket_id] = name
+        return name
 
     def note_frame_payload(self, socket_id: int, payload: str) -> list[str]:
         """Feed one raw WebSocket payload; returns the tones newly discovered."""
@@ -91,13 +106,19 @@ class ProfileCollector:
             if not isinstance(argument, dict):
                 continue
 
+            surface = self.surfaces.setdefault(
+                self._socket_surface.get(socket_id, WEB), Surface()
+            )
             for key, target in (
-                ("optionsSets", self.option_sets),
-                ("allowedMessageTypes", self.allowed_message_types),
+                ("optionsSets", surface.option_sets),
+                ("allowedMessageTypes", surface.allowed_message_types),
             ):
                 values = argument.get(key)
                 if isinstance(values, list):
                     target[:] = [v for v in values if isinstance(v, str)]
+            sent_plugins = argument.get("plugins")
+            if isinstance(sent_plugins, list):
+                surface.plugins = [p for p in sent_plugins if isinstance(p, dict)]
 
             tone = argument.get("tone")
             if isinstance(tone, str) and tone:
@@ -109,10 +130,8 @@ class ProfileCollector:
 
     def build(self) -> TenantProfile:
         return TenantProfile(
-            query=dict(self.query),
+            surfaces={name: s for name, s in self.surfaces.items() if not s.is_empty},
             tones=dict(self.tones),
-            option_sets=list(self.option_sets),
-            allowed_message_types=list(self.allowed_message_types),
         )
 
 
@@ -127,10 +146,11 @@ async def run(collector: ProfileCollector) -> None:
     finished = asyncio.Event()
 
     def on_websocket(ws: Any) -> None:
-        if not collector.note_url(ws.url):
-            return
-        _notice("Chathub connection seen — tenant surface recorded.")
         socket_id = id(ws)
+        surface = collector.note_url(ws.url, socket_id)
+        if surface is None:
+            return
+        _notice(f"Chathub connection seen — recording the '{surface}' surface.")
 
         def on_frame_sent(payload: Any) -> None:
             if not isinstance(payload, str):
@@ -164,6 +184,8 @@ async def run(collector: ProfileCollector) -> None:
             _notice("Opening Microsoft 365 Copilot.")
             _notice("For each model you want to use: pick it in the model selector,")
             _notice("send any short message, and wait for the reply to start.")
+            _notice("Run this once with Work IQ on and once with it off to record")
+            _notice("both surfaces — each run keeps the other one.")
             _notice("Close the window (or press Ctrl-C) when you are done.")
             await page.goto(CHAT_URL, wait_until="domcontentloaded")
 

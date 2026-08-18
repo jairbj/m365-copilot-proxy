@@ -16,7 +16,7 @@ import logging
 import sys
 
 from m365_copilot_proxy.auth.tokens import NeedsLoginError, decode_jwt, get_chat_token
-from m365_copilot_proxy.bizchat.protocol import DEFAULT_MODEL
+from m365_copilot_proxy.bizchat.protocol import DEFAULT_MODEL, parse_model
 from m365_copilot_proxy.bizchat.session import BizChatError, CopilotSession, TurnResult
 
 
@@ -45,12 +45,14 @@ async def main() -> int:
 
     session = CopilotSession()
     result = TurnResult()
+    base_model, work_iq = parse_model(args.model)
     try:
         async for chunk in session.chat(
             token=token,
             text=" ".join(args.prompt),
-            model=args.model,
+            model=base_model,
             generate_images=args.images,
+            work_iq=work_iq,
             result=result,
         ):
             print(chunk, end="", flush=True)

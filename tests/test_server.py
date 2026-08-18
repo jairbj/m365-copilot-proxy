@@ -252,6 +252,46 @@ async def test_output_at_the_ceiling_reports_length(client, fake_bizchat, monkey
     get_settings.cache_clear()
 
 
+async def test_the_work_suffix_reaches_the_wire_and_keeps_the_tone(
+    client, fake_bizchat, monkeypatch
+):
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-5.5-work", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    from urllib.parse import parse_qs, urlparse
+
+    assert parse_qs(urlparse(fake.urls[0]).query)["agent"] == ["work"]
+    # The suffix must not leak into the tone lookup.
+    from m365_copilot_proxy.bizchat import protocol
+
+    assert fake.chat_arguments["tone"] == protocol.MODEL_TONES["gpt-5.5"]
+
+
+async def test_the_same_thread_with_and_without_work_iq_is_two_conversations(
+    client, fake_bizchat, monkeypatch
+):
+    # One BizChat conversation cannot change surface midway, so the ids have to
+    # split into separate ones.
+    fake = await fake_bizchat([snapshot_frame("a"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+    messages = [{"role": "user", "content": "same opening line"}]
+
+    await client.post("/v1/chat/completions", json={"model": "claude-sonnet", "messages": messages})
+    await client.post(
+        "/v1/chat/completions", json={"model": "claude-sonnet-work", "messages": messages}
+    )
+    assert len(server_module.pool) == 2
+
+
+async def test_models_lists_the_work_variants(client: httpx.AsyncClient):
+    ids = {model["id"] for model in (await client.get("/v1/models")).json()["data"]}
+    assert "claude-sonnet-work" in ids
+
+
 async def test_health_reports_the_conversation_count(client: httpx.AsyncClient):
     response = await client.get("/health")
     assert response.json()["status"] == "ok"
