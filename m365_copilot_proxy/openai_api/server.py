@@ -11,8 +11,10 @@ from collections.abc import AsyncIterator
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from m365_copilot_proxy import tls
 from m365_copilot_proxy.auth.tokens import (
     NeedsLoginError,
+    TlsTrustError,
     account_summary,
     decode_jwt,
     get_chat_token,
@@ -45,11 +47,17 @@ pool = SessionPool()
 
 
 def create_app() -> FastAPI:
+    tls.configure()
     app = FastAPI(title="m365-copilot-proxy", version="0.1.0")
 
     @app.exception_handler(NeedsLoginError)
     async def _needs_login(_: Request, exc: NeedsLoginError) -> JSONResponse:
         return error_response(str(exc), status=401, error_type="authentication_error")
+
+    @app.exception_handler(TlsTrustError)
+    async def _tls_error(_: Request, exc: TlsTrustError) -> JSONResponse:
+        # Not a 401: signing in again would hit the same wall.
+        return error_response(str(exc), status=502, error_type="tls_error")
 
     @app.exception_handler(BizChatError)
     async def _bizchat_error(_: Request, exc: BizChatError) -> JSONResponse:

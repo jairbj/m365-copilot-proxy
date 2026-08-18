@@ -46,6 +46,17 @@ class Settings(BaseSettings):
     login_timezone: str = "UTC"
     #: Explicit Chromium binary. Empty = let Playwright use its bundled browser.
     chromium_path: str = ""
+    #: Let the browser accept certificates it cannot verify. Chromium reads its own
+    #: NSS store and cannot be pointed at a PEM, so behind corporate TLS inspection
+    #: the choice is importing the company root into NSS (see the README) or this.
+    #: It applies only to the windows this tool opens, which only visit Microsoft.
+    browser_ignore_tls_errors: bool = False
+
+    # --- TLS ---
+    #: Path to a PEM bundle to verify certificates against. Needed on networks that
+    #: perform TLS inspection. Left empty, the system trust store is used.
+    #: `REQUESTS_CA_BUNDLE` and `SSL_CERT_FILE` are honoured as fallbacks.
+    ca_bundle: str = ""
 
     # --- BizChat behaviour ---
     #: M365 soft-caps output around ~3k tokens and CONCLUDES EARLY rather than

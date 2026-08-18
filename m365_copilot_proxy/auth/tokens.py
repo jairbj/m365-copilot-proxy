@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from m365_copilot_proxy import tls
 from m365_copilot_proxy.auth.constants import CHAT_SCOPES, IMAGE_SCOPES
 from m365_copilot_proxy.auth.msal_client import cached_account, get_app, save_cache
 
@@ -20,6 +21,10 @@ _ACCESS_TOKEN_RE = re.compile(r"(access_token=)[^&\s]+", re.IGNORECASE)
 #: One lock per scope set: concurrent requests share a single refresh instead of
 #: racing several against the same account.
 _locks: dict[str, asyncio.Lock] = {}
+
+
+class TlsTrustError(RuntimeError):
+    """Certificate verification failed — no amount of re-authenticating fixes it."""
 
 
 class NeedsLoginError(RuntimeError):
@@ -93,7 +98,15 @@ def _acquire_silent(scopes: list[str]) -> str:
     account = cached_account()
     if account is None:
         raise NeedsLoginError("no account in the token cache")
-    result = get_app().acquire_token_silent(scopes, account=account)
+    try:
+        result = get_app().acquire_token_silent(scopes, account=account)
+    except Exception as exc:
+        # A TLS failure here is not "you need to log in again" — logging in will
+        # fail the same way. Report the real cause.
+        explanation = tls.explain_ssl_error(exc, "login.microsoftonline.com")
+        if explanation:
+            raise TlsTrustError(explanation) from exc
+        raise
     save_cache()
     if not result or "access_token" not in result:
         detail = (result or {}).get("error_description") or "silent refresh failed"

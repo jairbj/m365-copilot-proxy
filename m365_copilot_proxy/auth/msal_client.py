@@ -13,6 +13,7 @@ from pathlib import Path
 
 import msal
 
+from m365_copilot_proxy import tls
 from m365_copilot_proxy.auth.constants import AUTHORITY, CLIENT_ID
 from m365_copilot_proxy.config import get_settings
 
@@ -49,8 +50,14 @@ def get_app() -> msal.PublicClientApplication:
     global _app, _cache
     if _app is None:
         _cache = _load_cache(get_settings().msal_cache_file)
+        tls.configure()
+        # `verify` reaches the requests session MSAL talks to Entra ID with; None
+        # leaves it on whatever `tls.configure()` established.
         _app = msal.PublicClientApplication(
-            CLIENT_ID, authority=AUTHORITY, token_cache=_cache
+            CLIENT_ID,
+            authority=AUTHORITY,
+            token_cache=_cache,
+            verify=tls.ca_bundle() or True,
         )
     return _app
 

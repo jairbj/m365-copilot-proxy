@@ -9,6 +9,7 @@ import sys
 
 import typer
 
+from m365_copilot_proxy import tls
 from m365_copilot_proxy.config import get_settings
 
 cli = typer.Typer(
@@ -74,6 +75,38 @@ def status() -> None:
         f"(until {claims.expires_at.isoformat()})"
     )
     typer.echo("Silent refresh works — no browser needed.")
+
+
+@cli.command()
+def doctor() -> None:
+    """Check whether this machine can reach Microsoft over TLS."""
+    from m365_copilot_proxy import diagnostics
+
+    _setup_logging("WARNING")
+    for line in diagnostics.environment_report():
+        typer.echo(line)
+    typer.echo("")
+
+    failed = False
+    for result in diagnostics.run_checks():
+        if result.ok:
+            typer.secho(f"PASS  {result.name}", fg=typer.colors.GREEN)
+            typer.echo(f"      {result.detail}")
+        else:
+            failed = True
+            typer.secho(f"FAIL  {result.name}", fg=typer.colors.RED)
+            for line in result.detail.splitlines():
+                typer.echo(f"      {line}")
+
+    if failed:
+        typer.echo("")
+        typer.secho(
+            "See the 'Corporate TLS interception' section of the README.",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(1)
+    typer.echo("")
+    typer.echo("TLS looks good.")
 
 
 @cli.command()
@@ -171,6 +204,7 @@ def serve(
 
 
 def main() -> None:
+    tls.configure()
     try:
         cli()
     except KeyboardInterrupt:

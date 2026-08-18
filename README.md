@@ -46,9 +46,14 @@ uv sync
 uv run playwright install chromium   # only used for the login window
 ```
 
+Playwright does not yet ship wheels for every dependency on Python 3.14. If `uv`
+picks it and the browser misbehaves, pin an older interpreter for the run:
+`uv run --python 3.12 m365-copilot-proxy login`.
+
 ## Use
 
 ```bash
+uv run m365-copilot-proxy doctor   # checks TLS reachability (see below if it fails)
 uv run m365-copilot-proxy login    # opens a browser; complete SSO/MFA yourself
 uv run m365-copilot-proxy status   # confirms silent refresh works
 uv run m365-copilot-proxy capture  # learns your tenant's models — see below
@@ -233,6 +238,73 @@ called them consistently. If your tenant behaves differently, any id from
 * **No file or image input.** Non-text content parts are dropped, so dragging an
   image into the chat sends only the text around it.
 
+## Corporate TLS interception
+
+If `login` or `doctor` fails like this:
+
+```
+SSLCertVerificationError: certificate verify failed: unable to get local issuer certificate
+```
+
+your network is inspecting TLS: a proxy terminates the connection and re-signs it
+with your company's root CA. The certificate is valid *for your machine* — but
+Python does not read the operating system's certificate store by default, so it
+never learns about that root.
+
+Start by finding out where you stand:
+
+```bash
+uv run m365-copilot-proxy doctor
+```
+
+It prints which bundle is in use and tests both endpoints the proxy needs. They go
+through different TLS stacks — MSAL uses `requests`, the chat uses a raw socket —
+so one can pass while the other fails.
+
+**If both checks pass**, nothing to do: the company root is already in your system
+trust store and the proxy picks it up automatically.
+
+**If they fail**, point the proxy at the root explicitly. On WSL the root usually
+lives in Windows, not in the Linux distro, so export it first:
+
+```powershell
+certutil -store Root                      # find your company's root by name
+certutil -store Root "<name>" corp.cer    # export it
+certutil -encode corp.cer corp.pem        # convert to PEM
+```
+
+From WSL that file is under `/mnt/c/...` — wherever you ran `certutil`. Then
+combine it with the public CAs and point the proxy at the result:
+
+```bash
+cat "$(uv run python -c 'import certifi; print(certifi.where())')" corp.pem > ~/corp-bundle.pem
+export M365_CA_BUNDLE=~/corp-bundle.pem
+uv run m365-copilot-proxy doctor
+```
+
+Concatenating matters: a bundle containing *only* the company root breaks every
+host that is not being intercepted.
+
+### The browser is separate
+
+Chromium keeps its own certificate store and cannot be pointed at a PEM, so the
+login and capture windows need their own fix. Import the root into NSS (needs
+`libnss3-tools`):
+
+```bash
+certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n corp -i corp.pem
+```
+
+Or, as a last resort, `M365_BROWSER_IGNORE_TLS_ERRORS=1`. That turns off
+certificate checking for the windows this tool opens — which only ever visit
+Microsoft domains, on a network that is already inspecting the traffic — but it is
+off by default because it is still a real reduction in verification.
+
+### Explicit proxies
+
+`HTTPS_PROXY` / `NO_PROXY` are honoured throughout: `requests` and `httpx` read
+them directly, and `websockets` uses the system proxy configuration by default.
+
 ## Configuration
 
 Everything is settable through `M365_*` environment variables or a `.env` file:
@@ -243,6 +315,8 @@ Everything is settable through `M365_*` environment variables or a `.env` file:
 | `M365_CONFIG_DIR` | `~/.config/m365-copilot-proxy` | Token cache, browser profile, tenant profile |
 | `M365_LOGIN_TIMEOUT` | `600` | Seconds to wait for the sign-in |
 | `M365_CHROMIUM_PATH` | *(bundled)* | Use a system Chromium instead |
+| `M365_CA_BUNDLE` | *(system trust)* | PEM to verify certificates against |
+| `M365_BROWSER_IGNORE_TLS_ERRORS` | `false` | Let the browser skip certificate checks |
 | `M365_TURN_TIMEOUT` | `300` | Seconds of silence before a turn fails |
 | `M365_SESSION_IDLE_TIMEOUT` | `1800` | Idle seconds before a conversation is evicted |
 | `M365_OUTPUT_CHAR_CEILING` | `12000` | Report `finish_reason: "length"` above this; `0` disables |

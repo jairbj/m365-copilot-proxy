@@ -14,6 +14,7 @@ import logging
 import sys
 from typing import Any
 
+from m365_copilot_proxy import tls
 from m365_copilot_proxy.auth.constants import CHAT_SCOPES, REDIRECT_URI
 from m365_copilot_proxy.auth.msal_client import get_app, save_cache
 from m365_copilot_proxy.config import get_settings
@@ -23,6 +24,11 @@ log = logging.getLogger(__name__)
 
 class LoginError(RuntimeError):
     pass
+
+
+def _describe(exc: Exception) -> str:
+    """The TLS explanation when that is the cause, otherwise the plain error."""
+    return tls.explain_ssl_error(exc, "login.microsoftonline.com") or str(exc)
 
 
 def _notice(message: str) -> None:
@@ -53,6 +59,8 @@ def browser_launch_kwargs() -> dict[str, Any]:
     }
     if settings.chromium_path:
         kwargs["executable_path"] = settings.chromium_path
+    if settings.browser_ignore_tls_errors:
+        kwargs["ignore_https_errors"] = True
     return kwargs
 
 
@@ -129,7 +137,12 @@ async def login(scopes: list[str] | None = None) -> str:
     """Run the interactive login and return the acquired access token."""
     scopes = scopes or CHAT_SCOPES
     app = get_app()
-    flow = app.initiate_auth_code_flow(scopes, redirect_uri=REDIRECT_URI)
+    try:
+        flow = app.initiate_auth_code_flow(scopes, redirect_uri=REDIRECT_URI)
+    except Exception as exc:
+        # This is the first call that touches the network, so it is where a
+        # corporate TLS-inspecting proxy shows up.
+        raise LoginError(_describe(exc)) from exc
     if "auth_uri" not in flow:
         raise LoginError(f"Could not build the authorization URL: {flow}")
 
@@ -137,7 +150,10 @@ async def login(scopes: list[str] | None = None) -> str:
         flow["auth_uri"], get_settings().login_timeout
     )
 
-    result = await asyncio.to_thread(app.acquire_token_by_auth_code_flow, flow, auth_response)
+    try:
+        result = await asyncio.to_thread(app.acquire_token_by_auth_code_flow, flow, auth_response)
+    except Exception as exc:
+        raise LoginError(_describe(exc)) from exc
     save_cache()
     if "access_token" not in result:
         detail = result.get("error_description") or result.get("error") or str(result)

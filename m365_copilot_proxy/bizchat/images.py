@@ -16,6 +16,8 @@ from typing import Any
 
 import httpx
 
+from m365_copilot_proxy import tls
+
 log = logging.getLogger(__name__)
 
 #: Above this, a data URI is more of a burden than a convenience for the client.
@@ -69,7 +71,9 @@ def capture_images(message: dict[str, Any], into: dict[str, GeneratedImage]) -> 
 
 
 async def fetch_image_bytes(url: str, artifact_token: str) -> tuple[bytes, str]:
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=60.0, follow_redirects=True, verify=tls.httpx_verify()
+    ) as client:
         response = await client.get(url, headers={"Authorization": f"Bearer {artifact_token}"})
         response.raise_for_status()
         content_type = response.headers.get("content-type", "image/png").split(";")[0]

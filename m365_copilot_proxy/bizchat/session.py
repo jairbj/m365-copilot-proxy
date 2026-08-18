@@ -19,6 +19,7 @@ from urllib.parse import urlencode
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
+from m365_copilot_proxy import tls
 from m365_copilot_proxy.auth.tokens import decode_jwt, redact
 from m365_copilot_proxy.bizchat import frames, protocol
 from m365_copilot_proxy.bizchat.images import GeneratedImage, capture_images
@@ -139,105 +140,117 @@ class CopilotSession:
         handshake_done = False
         completed = False
 
-        async with connect(
-            url,
-            origin=protocol.ORIGIN,  # type: ignore[arg-type]
-            user_agent_header=protocol.USER_AGENT,
-            additional_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-            },
-            max_size=None,
-            open_timeout=30,
-        ) as ws:
-            try:
-                await ws.send(frames.handshake_frame())
-                buffer = ""
-                while not completed:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=settings.turn_timeout)
-                    except TimeoutError as exc:
-                        raise BizChatError(
-                            f"No response from Copilot for {settings.turn_timeout:.0f}s"
-                        ) from exc
-                    except ConnectionClosed as exc:
-                        # The server hangs up once the turn is done; only a close
-                        # before any content is a real failure.
-                        if answer or result.message_type:
-                            log.debug("Connection closed after the answer: %s", exc)
-                            break
-                        raise BizChatError(
-                            "Copilot closed the connection before answering "
-                            f"({exc.__class__.__name__})"
-                        ) from exc
+        try:
+            async with connect(
+                url,
+                origin=protocol.ORIGIN,  # type: ignore[arg-type]
+                user_agent_header=protocol.USER_AGENT,
+                additional_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+                max_size=None,
+                open_timeout=30,
+                # `websockets` rejects an ssl argument on a plain ws:// URI.
+                ssl=tls.ssl_context() if url.startswith("wss://") else None,
+            ) as ws:
+                try:
+                    await ws.send(frames.handshake_frame())
+                    buffer = ""
+                    while not completed:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=settings.turn_timeout)
+                        except TimeoutError as exc:
+                            raise BizChatError(
+                                f"No response from Copilot for {settings.turn_timeout:.0f}s"
+                            ) from exc
+                        except ConnectionClosed as exc:
+                            # The server hangs up once the turn is done; only a close
+                            # before any content is a real failure.
+                            if answer or result.message_type:
+                                log.debug("Connection closed after the answer: %s", exc)
+                                break
+                            raise BizChatError(
+                                "Copilot closed the connection before answering "
+                                f"({exc.__class__.__name__})"
+                            ) from exc
 
-                    buffer += raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
-                    complete, buffer = frames.split_frames(buffer)
+                        buffer += raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+                        complete, buffer = frames.split_frames(buffer)
 
-                    for chunk in complete:
-                        frame = frames.parse(chunk)
-                        self._dump(request_id, "recv", frame if frame is not None else chunk)
+                        for chunk in complete:
+                            frame = frames.parse(chunk)
+                            self._dump(request_id, "recv", frame if frame is not None else chunk)
 
-                        if not handshake_done:
-                            handshake_done = True
-                            error = frames.handshake_error(frame)
-                            if error:
-                                raise BizChatError(f"Handshake rejected: {error}")
-                            await self._send_turn(
-                                ws,
-                                request_id=request_id,
-                                text=text,
-                                model=model,
-                                is_first=is_first,
-                                options_sets=options_sets,
-                                allowed=allowed,
-                            )
-                            continue
+                            if not handshake_done:
+                                handshake_done = True
+                                error = frames.handshake_error(frame)
+                                if error:
+                                    raise BizChatError(f"Handshake rejected: {error}")
+                                await self._send_turn(
+                                    ws,
+                                    request_id=request_id,
+                                    text=text,
+                                    model=model,
+                                    is_first=is_first,
+                                    options_sets=options_sets,
+                                    allowed=allowed,
+                                )
+                                continue
 
-                        if frame is None:
-                            continue
+                            if frame is None:
+                                continue
 
-                        kind = frame.get("type")
-                        if kind == frames.TYPE_PING:
-                            await ws.send(frames.ping_frame())
-                            continue
+                            kind = frame.get("type")
+                            if kind == frames.TYPE_PING:
+                                await ws.send(frames.ping_frame())
+                                continue
 
-                        if kind == frames.TYPE_INVOCATION:
-                            pieces = self._handle_update(frame, result, images)
-                        elif kind == frames.TYPE_STREAM_ITEM:
-                            pieces = self._handle_stream_item(frame, result, images)
-                            completed = True
-                        elif kind == frames.TYPE_COMPLETION:
-                            pieces = []
-                            error = frame.get("error")
-                            if isinstance(error, str) and error:
-                                raise BizChatError(f"Copilot rejected the turn: {error}")
-                            completed = True
-                        elif kind == frames.TYPE_CLOSE:
-                            pieces = []
-                            error = frame.get("error")
-                            if isinstance(error, str) and error:
-                                raise BizChatError(f"Copilot closed the connection: {error}")
-                            completed = True
-                        else:
-                            continue
+                            if kind == frames.TYPE_INVOCATION:
+                                pieces = self._handle_update(frame, result, images)
+                            elif kind == frames.TYPE_STREAM_ITEM:
+                                pieces = self._handle_stream_item(frame, result, images)
+                                completed = True
+                            elif kind == frames.TYPE_COMPLETION:
+                                pieces = []
+                                error = frame.get("error")
+                                if isinstance(error, str) and error:
+                                    raise BizChatError(f"Copilot rejected the turn: {error}")
+                                completed = True
+                            elif kind == frames.TYPE_CLOSE:
+                                pieces = []
+                                error = frame.get("error")
+                                if isinstance(error, str) and error:
+                                    raise BizChatError(f"Copilot closed the connection: {error}")
+                                completed = True
+                            else:
+                                continue
 
-                        for kind_of_piece, piece in pieces:
-                            candidate = answer + piece if kind_of_piece == "delta" else piece
-                            answer, emit = frames.fold_stream_text(answer, candidate)
-                            if emit:
-                                yield emit
+                            for kind_of_piece, piece in pieces:
+                                candidate = answer + piece if kind_of_piece == "delta" else piece
+                                answer, emit = frames.fold_stream_text(answer, candidate)
+                                if emit:
+                                    yield emit
 
-                        if completed:
-                            break
-            finally:
-                # Reaching here without the turn having completed means the caller
-                # walked away (HTTP client disconnected) or something failed. Cancel
-                # the turn the way the real "Stop generating" button does, so the
-                # server stops generating an answer nobody will read.
-                if not completed and handshake_done:
-                    await self._send_stop(ws, request_id)
+                            if completed:
+                                break
+                finally:
+                    # Reaching here without the turn having completed means the caller
+                    # walked away (HTTP client disconnected) or something failed. Cancel
+                    # the turn the way the real "Stop generating" button does, so the
+                    # server stops generating an answer nobody will read.
+                    if not completed and handshake_done:
+                        await self._send_stop(ws, request_id)
+
+        except Exception as exc:
+            # The WebSocket verifies certificates with its own stack, so it can
+            # fail here even when MSAL's HTTPS calls went through. Anything that
+            # is not a certificate problem passes through untouched.
+            explanation = tls.explain_ssl_error(exc, protocol.WS_HOST)
+            if explanation:
+                raise BizChatError(explanation) from exc
+            raise
 
         result.text = answer
         result.images = list(images.values())
