@@ -37,9 +37,24 @@ def test_the_two_configs_offer_the_same_models():
     assert sorted(opencode_model_ids()) == sorted(pi_model_ids())
 
 
-def test_the_work_iq_variant_is_advertised():
+def test_every_model_is_offered_in_both_surfaces():
+    """The configs are meant to be copied as-is, so the Work IQ variant of each
+    model has to be in the picker already — nobody should have to hand-write an id
+    to reach their work content."""
     for ids in (opencode_model_ids(), pi_model_ids()):
-        assert any(i.endswith(protocol.WORK_SUFFIX) for i in ids)
+        base = [i for i in ids if not i.endswith(protocol.WORK_SUFFIX)]
+        work = {i for i in ids if i.endswith(protocol.WORK_SUFFIX)}
+        missing = [i for i in base if f"{i}{protocol.WORK_SUFFIX}" not in work]
+        assert not missing, f"models with no Work IQ variant: {missing}"
+
+
+def test_the_work_variants_resolve_to_their_base_model():
+    # A suffix that did not parse would quietly serve the default tone.
+    for ids in (opencode_model_ids(), pi_model_ids()):
+        for model_id in (i for i in ids if i.endswith(protocol.WORK_SUFFIX)):
+            base, work_iq = protocol.parse_model(model_id)
+            assert work_iq is True
+            assert base in protocol.model_tones()
 
 
 def test_pi_declares_the_compat_flags_that_match_this_proxy():

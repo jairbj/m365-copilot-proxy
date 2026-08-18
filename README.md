@@ -224,7 +224,9 @@ them without a second authenticated fetch.
 
 Copy [`examples/opencode.json`](examples/opencode.json) to
 `~/.config/opencode/opencode.json` (applies everywhere) or to `opencode.json` in a
-project (applies there and wins over the global one):
+project (applies there and wins over the global one). It ships every model in both
+surfaces — each id and its `-work` twin — so `/models` is ready to use as-is; the
+excerpt below is shortened:
 
 ```json
 {
@@ -297,7 +299,9 @@ called them consistently. If your tenant behaves differently, any id from
 ## Using it with pi
 
 [pi](https://pi.dev) reads custom providers from `~/.pi/agent/models.json`. Copy
-[`examples/pi-models.json`](examples/pi-models.json) there:
+[`examples/pi-models.json`](examples/pi-models.json) there. Like the opencode one,
+it lists every model in both surfaces, so `/model` is ready to use as-is; the
+excerpt below is shortened:
 
 ```json
 {
