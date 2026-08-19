@@ -6,6 +6,7 @@ format still matches production. Run it after any protocol change:
 
     uv run python scripts/live_smoke.py "say hi in three words"
     uv run python scripts/live_smoke.py --model claude-sonnet "which model are you?"
+    uv run python scripts/live_smoke.py --model agent:agent-1 "who are you?"
 """
 
 from __future__ import annotations
@@ -16,7 +17,12 @@ import logging
 import sys
 
 from m365_copilot_proxy.auth.tokens import NeedsLoginError, decode_jwt, get_chat_token
-from m365_copilot_proxy.bizchat.protocol import DEFAULT_MODEL, parse_model
+from m365_copilot_proxy.bizchat.protocol import (
+    DEFAULT_MODEL,
+    agent_for_model,
+    is_agent_id,
+    parse_model,
+)
 from m365_copilot_proxy.bizchat.session import BizChatError, CopilotSession, TurnResult
 
 
@@ -39,13 +45,24 @@ async def main() -> int:
         print(exc, file=sys.stderr)
         return 1
 
+    base_model, work_iq = parse_model(args.model)
+    # An `agent:` id has to be resolved here too, or the turn goes to plain Copilot
+    # under the agent's name — which looks like a pass and proves nothing.
+    agent = agent_for_model(base_model)
+    if agent is None and is_agent_id(base_model):
+        print(
+            f"No captured agent named '{base_model}'. Run `m365-copilot-proxy capture`, "
+            "open it in the chat window and send it a message.",
+            file=sys.stderr,
+        )
+        return 1
+
     claims = decode_jwt(token)
     print(f"Account: {claims.upn or claims.oid}  (token valid {int(claims.seconds_remaining)}s)")
     print(f"Model:   {args.model}\n")
 
     session = CopilotSession()
     result = TurnResult()
-    base_model, work_iq = parse_model(args.model)
     try:
         async for chunk in session.chat(
             token=token,
@@ -53,6 +70,7 @@ async def main() -> int:
             model=base_model,
             generate_images=args.images,
             work_iq=work_iq,
+            agent=agent,
             result=result,
         ):
             print(chunk, end="", flush=True)
