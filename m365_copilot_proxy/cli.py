@@ -203,15 +203,17 @@ def prompt(
     key: str = typer.Option(None, help="Show one recorded conversation instead of the latest."),
     show_list: bool = typer.Option(False, "--list", help="List what has been recorded."),
     out: str = typer.Option("", "--out", help="Write the document to a file."),
-    raw: bool = typer.Option(False, help="The client's system prompt alone, no tool contract."),
-    contract: bool = typer.Option(False, help="The tool contract alone, no system prompt."),
+    raw: bool = typer.Option(False, help="The client's system prompt alone."),
+    contract: bool = typer.Option(False, help="The tool contract alone."),
+    tools: bool = typer.Option(False, help="The list of the client's tools alone."),
 ) -> None:
     """Show the instructions to paste into a declarative agent.
 
     M365 Copilot often ignores the system prompt the proxy inlines, and honours a
-    declarative agent's instructions instead. This prints what to put there: the
-    document goes to stdout, its size to stderr, so it can be piped straight into a
-    file or a clipboard command.
+    declarative agent's instructions instead. This prints what to put there — the
+    contract, the client's tools and its system prompt — and a turn bound to an agent
+    sends none of it, so whatever is not pasted is not sent. The document goes to
+    stdout and its size to stderr, so it pipes straight into a file or a clipboard.
     """
     from m365_copilot_proxy import agent_instructions
 
@@ -224,32 +226,42 @@ def prompt(
             raise typer.Exit(1)
         for entry in records:
             typer.echo(
-                f"{entry.key}  {len(entry.system_text):>6} chars  "
+                f"{entry.key}  {len(entry.system_text):>6} prompt  "
+                f"{len(entry.tool_text):>6} tools  "
                 f"{entry.model or '?':<20} {entry.recorded_at or ''}"
             )
             if entry.label:
                 typer.echo(f"    {entry.label}")
         return
 
-    if raw and contract:
-        typer.secho("Choose --raw or --contract, not both.", fg=typer.colors.RED, err=True)
+    picked = (("--raw", raw), ("--contract", contract), ("--tools", tools))
+    chosen = [name for name, on in picked if on]
+    if len(chosen) > 1:
+        typer.secho(
+            f"Choose one of {', '.join(chosen)}, not several.", fg=typer.colors.RED, err=True
+        )
         raise typer.Exit(2)
 
     if contract:
         # The contract stands on its own: it is the same text for every client, so
         # it needs no recording to exist.
-        document = agent_instructions.compose(contract=True, prompt=False)
+        document = agent_instructions.compose(contract=True, tools=False, prompt=False)
     else:
         record = agent_instructions.load(key) if key else agent_instructions.latest()
         if record is None:
             typer.secho(
-                "No system prompt recorded yet. Send one request through the proxy "
-                "first, then run this again.",
+                "Nothing recorded yet. Send one request through the proxy first, "
+                "then run this again.",
                 fg=typer.colors.YELLOW,
                 err=True,
             )
             raise typer.Exit(1)
-        document = record.compose(contract=not raw, prompt=True)
+        only = raw or tools
+        document = record.compose(
+            contract=not only,
+            tools=tools or not only,
+            prompt=raw or not only,
+        )
 
     if out:
         destination = Path(out)

@@ -218,13 +218,15 @@ Copilot UI) and it is honoured instead.
 
 So: build the agent once, point the proxy at it, and every turn starts inside it.
 
-**1. Get the text.** The proxy keeps a copy of the system prompt of each conversation
-it starts, and prints it composed with the tool-calling contract:
+**1. Get the text.** The proxy keeps a copy of what each conversation told the model
+to be — the system prompt and the client's tool list — and prints it composed with the
+tool-calling contract:
 
 ```bash
-uv run m365-copilot-proxy prompt              # latest, contract + system prompt
+uv run m365-copilot-proxy prompt              # latest: contract + tools + prompt
 uv run m365-copilot-proxy prompt --list       # what has been recorded
 uv run m365-copilot-proxy prompt --contract   # the tool contract alone
+uv run m365-copilot-proxy prompt --tools      # the client's tool list alone
 uv run m365-copilot-proxy prompt --raw        # the client's system prompt alone
 uv run m365-copilot-proxy prompt --out agent.md
 ```
@@ -233,14 +235,19 @@ The document goes to stdout and its size to stderr, so it pipes cleanly:
 
 ```
   Tool calling           980 chars
+  Available tools      3,410 chars
   System prompt        9,210 chars
-  Total               10,190 chars — 2,190 over the agent's 8,000-character field.
+  Total               13,600 chars — 5,600 over the agent's 8,000-character field.
 ```
 
 An agent's instructions field holds **8000 characters** and nothing here trims to
-fit: which paragraph to drop is your call, not the proxy's. The tool contract is
-~1k of that, and it is the half worth installing — it is what teaches the model to
-keep calling tools across turns instead of answering after the first result.
+fit: which paragraph to drop is your call, not the proxy's. With an agentic client
+the three together will not fit, and that report is how you decide what goes.
+
+The tool list is a **snapshot**. It changes with the project and with every MCP server
+the client loads, and a stale one in the agent means the model calls tools the client
+no longer offers — the client answers with an error instead of a result. Re-export and
+re-paste when the toolset changes.
 
 `GET /v1/system-prompt` returns the same document as JSON (`?format=text` for the
 raw body), and `GET /v1/system-prompts` lists what has been recorded. Recording is
@@ -317,11 +324,11 @@ be is replayed as recorded, along with the rest of the turn: an agent seen sendi
 never asks for. An `agent:` id that was never captured fails the turn rather than
 quietly serving plain Copilot under the agent's name.
 
-Because the agent carries the instructions, an agent turn does **not** repeat the
-`[System instructions]` block or the tool contract; only the per-request tool list
-still travels, since the agent cannot know it. If you change the client's prompt and
-have not updated the agent yet, `M365_AGENT_SEND_SYSTEM=1` puts both back inline, so
-the turn carries what a plain-Copilot one would.
+Because the agent carries all of it, an agent turn sends **the message and nothing
+else** — no `[System instructions]` block, no tool contract, no tool list. Whatever is
+not pasted into the agent is not sent at all. If the agent has drifted behind the
+client, `M365_AGENT_SEND_SYSTEM=1` puts the three back inline, so the turn carries
+what a plain-Copilot one would.
 
 **Creating the agent from here** is not supported: it is a browser flow with no
 documented API. `capture --record-api` writes the site's own write calls (method,
@@ -505,11 +512,11 @@ No `-work` twin for it: an agent has no Work IQ toggle. Rename the slug in
 `profile.json` if `agent-1` is not a name you want in a picker — a later capture
 matches the agent by its id, so the rename survives.
 
-One thing to do before using an agent from an agentic client: paste the tool contract
-into the agent's instructions (`m365-copilot-proxy prompt --contract`, ~1k of the
-8000). An agent turn does not carry the contract inline — only the per-request tool
-list — so without it there tool calling has no format to follow. `M365_AGENT_SEND_SYSTEM=1`
-puts it back inline meanwhile.
+One thing to do before using an agent from pi: run one turn so the proxy records
+pi's tool list, then paste `m365-copilot-proxy prompt` into the agent's instructions.
+An agent turn carries only the message, so the contract and the tool list have to be
+there or the model has neither a format to follow nor anything to call.
+`M365_AGENT_SEND_SYSTEM=1` sends them inline meanwhile.
 
 ### Caveats
 

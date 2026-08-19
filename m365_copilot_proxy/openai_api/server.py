@@ -204,9 +204,10 @@ async def run_completion(body: ChatCompletionRequest) -> object:
     # Held for the whole turn so two requests never run on one session. On the
     # streaming path ownership passes to the response generator, which outlives
     # this function — hence the manual acquire/release rather than `async with`.
-    # An agent carries the system prompt and the tool contract in its own
-    # instructions, so a turn inside one sends neither — unless it has drifted out of
-    # sync with the client, which is what the setting is for.
+    # An agent carries the system prompt, the tool contract AND the tool list in its
+    # own instructions, so a turn inside one sends the message and nothing else —
+    # unless it has drifted out of sync with the client, which is what the setting is
+    # for.
     inline_instructions = agent is None or settings.agent_send_system
 
     lock = pool.lock_for(key)
@@ -215,11 +216,13 @@ async def run_completion(body: ChatCompletionRequest) -> object:
     try:
         turn = pool.acquire(key, len(body.messages))
         if turn.is_new:
-            # Recorded whether or not an agent is in play: the point of the record is
-            # to show what a client's system prompt would look like inside one.
+            # Recorded whether or not an agent is in play, and recorded WITHOUT the
+            # contract: this is the half that has to be pasted into an agent, and the
+            # contract is composed back on at export time.
             agent_instructions.record(
                 key,
                 "\n\n".join(system_texts(body.messages)),
+                tool_text=format_tool_instructions(body.tools or [], include_contract=False),
                 model=body.model,
                 label=opening_message,
             )
@@ -227,8 +230,8 @@ async def run_completion(body: ChatCompletionRequest) -> object:
             body.messages,
             start_index=turn.start_index,
             is_new_conversation=turn.is_new,
-            tool_instructions=format_tool_instructions(
-                body.tools or [], include_contract=inline_instructions
+            tool_instructions=(
+                format_tool_instructions(body.tools or []) if inline_instructions else ""
             ),
             include_system=inline_instructions,
         )

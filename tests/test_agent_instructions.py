@@ -113,3 +113,63 @@ class TestRecording:
 
         assert agent_instructions.list_records() == []
         assert agent_instructions.latest() is None
+
+
+class TestTheToolList:
+    """The tool list moved into the agent, so the export has to carry it."""
+
+    TOOLS = "[Available tools]\nTools:\n- run_shell: Run a shell command"
+
+    def test_the_document_reads_in_the_order_a_model_needs(self):
+        document = agent_instructions.compose("be terse", tool_text=self.TOOLS)
+
+        # How to call, what to call, then who to be.
+        assert [title for title, _ in document.breakdown()] == [
+            "Tool calling",
+            "Available tools",
+            "System prompt",
+        ]
+        assert document.text.index("run_shell") < document.text.index("be terse")
+
+    def test_each_part_can_stand_alone(self):
+        only_tools = agent_instructions.compose(
+            "be terse", tool_text=self.TOOLS, contract=False, prompt=False
+        )
+        assert only_tools.text == self.TOOLS
+
+    def test_a_client_that_declares_no_tools_contributes_no_section(self):
+        document = agent_instructions.compose("be terse", tool_text="")
+        assert [title for title, _ in document.breakdown()] == ["Tool calling", "System prompt"]
+
+    def test_the_tool_list_is_recorded_and_read_back(self):
+        agent_instructions.record("key1", "be terse", tool_text=self.TOOLS)
+
+        entry = agent_instructions.load("key1")
+        assert entry is not None
+        assert entry.tool_text == self.TOOLS
+        assert "run_shell" in entry.compose().text
+
+    def test_tools_alone_are_worth_recording(self):
+        # An agent turn sends no tool list, so this may be all there is to paste.
+        assert agent_instructions.record("key1", "", tool_text=self.TOOLS) is not None
+        latest = agent_instructions.latest()
+        assert latest is not None and latest.tool_text == self.TOOLS
+
+    def test_a_changed_tool_list_is_written_even_when_the_prompt_is_the_same(self):
+        path = agent_instructions.record("key1", "be terse", tool_text=self.TOOLS)
+        assert path is not None
+
+        agent_instructions.record("key1", "be terse", tool_text=self.TOOLS + "\n- ls: list")
+        reloaded = agent_instructions.load("key1")
+        assert reloaded is not None and "ls: list" in reloaded.tool_text
+
+    def test_a_record_from_before_this_still_loads(self):
+        entry = agent_instructions.Record.from_json(
+            {"key": "old", "system_text": "be terse", "model": "claude-sonnet"}
+        )
+        assert entry is not None
+        assert entry.tool_text == ""
+        assert entry.compose().text.endswith("be terse")
+
+    def test_nothing_at_all_records_nothing(self):
+        assert agent_instructions.record("key1", "  ", tool_text="  ") is None

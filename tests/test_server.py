@@ -451,11 +451,35 @@ async def test_the_captured_session_key_is_never_replayed(
         uuid.UUID(key)  # raises if it is not one
 
 
-async def test_an_agent_turn_sends_the_tool_list_without_the_contract(
+async def test_an_agent_turn_carries_the_message_and_nothing_else(
     client, fake_bizchat, monkeypatch, captured_agent
 ):
-    # The contract lives in the agent's instructions; the tool list cannot, because
-    # it changes with every request.
+    # Contract, tool list and system prompt all live in the agent's instructions.
+    # What is not pasted there is not sent at all.
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hello"},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "run_shell", "description": "run it"}}
+            ],
+        },
+    )
+
+    assert fake.chat_arguments["message"]["text"] == "hello"
+
+
+async def test_an_agent_turn_still_records_the_tool_list_to_paste(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    # The list has to reach the user somehow, or there is nothing to put in the agent.
     fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
     route_new_sessions_to(fake, monkeypatch)
 
@@ -470,9 +494,9 @@ async def test_an_agent_turn_sends_the_tool_list_without_the_contract(
         },
     )
 
-    sent = fake.chat_arguments["message"]["text"]
-    assert "run_shell" in sent
-    assert "```tool_call" not in sent
+    payload = (await client.get("/v1/system-prompt")).json()
+    assert "run_shell" in payload["text"]
+    assert [s["title"] for s in payload["sections"]] == ["Tool calling", "Available tools"]
 
 
 async def test_an_agent_that_has_drifted_can_be_sent_the_instructions_anyway(

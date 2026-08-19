@@ -37,6 +37,7 @@ KEEP_RECORDS = 20
 DIRNAME = "agent-instructions"
 
 CONTRACT_TITLE = "Tool calling"
+TOOLS_TITLE = "Available tools"
 PROMPT_TITLE = "System prompt"
 
 
@@ -108,7 +109,9 @@ def compose(
     system_text: str = "",
     *,
     contract: bool = True,
+    tools: bool = True,
     prompt: bool = True,
+    tool_text: str = "",
     key: str | None = None,
     model: str | None = None,
     label: str | None = None,
@@ -116,13 +119,16 @@ def compose(
 ) -> Document:
     """Build the document to paste into the agent's instructions field.
 
-    The tool contract comes first because it is the part a model has to obey to be
-    usable at all; the client's own system prompt follows. Either half can be left
-    out — `--contract` and `--raw` on the CLI.
+    In the order a model needs them: how to call a tool, what there is to call, and
+    then the client's own prompt. A turn bound to an agent carries none of the three,
+    so what is not pasted here is not sent at all. Any part can be left out —
+    `--contract`, `--tools` and `--raw` on the CLI.
     """
     sections: list[Section] = []
     if contract:
         sections.append(Section(CONTRACT_TITLE, TOOL_CONTRACT))
+    if tools and tool_text.strip():
+        sections.append(Section(TOOLS_TITLE, tool_text.strip()))
     if prompt and system_text.strip():
         sections.append(Section(PROMPT_TITLE, system_text.strip()))
     return Document(
@@ -132,17 +138,25 @@ def compose(
 
 @dataclass
 class Record:
-    """One observed system prompt, as written to disk."""
+    """What one conversation asked the model to be: its prompt and its tools."""
 
     key: str
     system_text: str
+    #: The `[Available tools]` block as the client's tools render, contract excluded.
+    #: Empty for a record made before agents took the tool list over.
+    tool_text: str = ""
     model: str | None = None
     label: str | None = None
     recorded_at: str | None = None
 
+    @property
+    def is_empty(self) -> bool:
+        return not (self.system_text.strip() or self.tool_text.strip())
+
     def compose(self, **kwargs: Any) -> Document:
         return compose(
             self.system_text,
+            tool_text=self.tool_text,
             key=self.key,
             model=self.model,
             label=self.label,
@@ -157,6 +171,7 @@ class Record:
             "label": self.label,
             "recorded_at": self.recorded_at,
             "system_text": self.system_text,
+            "tool_text": self.tool_text,
         }
 
     @classmethod
@@ -169,6 +184,7 @@ class Record:
         return cls(
             key=key,
             system_text=text,
+            tool_text=data.get("tool_text") if isinstance(data.get("tool_text"), str) else "",
             model=data.get("model") if isinstance(data.get("model"), str) else None,
             label=data.get("label") if isinstance(data.get("label"), str) else None,
             recorded_at=(
@@ -184,27 +200,41 @@ def _path_for(key: str) -> Path:
     return records_dir() / f"{_SAFE_KEY.sub('_', key)[:64]}.json"
 
 
-def record(key: str, system_text: str, *, model: str | None = None, label: str = "") -> Path | None:
-    """Remember the system prompt of a conversation that is starting.
+def record(
+    key: str,
+    system_text: str,
+    *,
+    tool_text: str = "",
+    model: str | None = None,
+    label: str = "",
+) -> Path | None:
+    """Remember what a conversation that is starting told the model to be.
 
     Called on every new conversation, so it is deliberately cheap and quiet: an
-    unchanged prompt is not rewritten, and a failure to write is logged rather than
+    unchanged record is not rewritten, and a failure to write is logged rather than
     raised — losing a copy of the prompt must never cost a turn.
-    """
-    if not get_settings().record_system_prompts or not system_text.strip():
-        return None
 
+    A client that declares tools but sends no system prompt is still worth recording:
+    for an agent, that list is the part that has to be pasted.
+    """
     entry = Record(
         key=key,
         system_text=system_text,
+        tool_text=tool_text,
         model=model,
         label=(label or "").strip()[:120] or None,
         recorded_at=datetime.now(tz=UTC).isoformat(),
     )
+    if not get_settings().record_system_prompts or entry.is_empty:
+        return None
+
     path = _path_for(key)
     try:
         existing = load(key)
-        if existing is not None and existing.system_text == system_text:
+        if existing is not None and (existing.system_text, existing.tool_text) == (
+            system_text,
+            tool_text,
+        ):
             return path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
