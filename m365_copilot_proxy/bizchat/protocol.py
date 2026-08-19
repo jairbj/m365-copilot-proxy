@@ -88,9 +88,11 @@ WORK_SUFFIX = "-work"
 WEB_SUFFIX = "-web"
 
 #: Model id prefix selecting a captured declarative agent — a custom agent built in
-#: the Copilot UI, entered through `threadLevelGptId`. Not to be confused with the
-#: `agent` QUERY field above, which names the Work IQ surface. An agent id takes no
-#: Work IQ suffix and no tone: the agent UI offers neither.
+#: the Copilot UI, entered through `threadLevelGptId` and a matching `gptId` query
+#: field. Not to be confused with the `agent` QUERY field above, which names the Work
+#: IQ surface — an agent connection sets that field to `Agent`, a third value. An
+#: agent id takes no Work IQ suffix and offers no choice of model: it serves the tone
+#: its own client was seen sending.
 AGENT_ID_PREFIX = "agent:"
 
 #: Static query-string fields identifying the client surface.
@@ -374,13 +376,25 @@ def allowed_message_types(
 def plugins(
     work_iq: bool | None = None,
     agent: tenant_profile.DeclarativeAgent | None = None,
-) -> list[dict[str, str]]:
-    """The plugin list for the requested surface, captured if available.
+) -> list[dict[str, str]] | None:
+    """The plugin list to send, or None to send no `plugins` field at all.
 
     An empty captured list means "this surface sends no plugins" and is honoured;
-    only a surface that never recorded them (`None`) falls back to the built-in.
+    a surface that never recorded them falls back to the built-in Bing entry, which
+    is what the observed web client sends on a plain turn.
+
+    A declarative agent gets no such fallback. A real capture shows an agent turn
+    carrying no `plugins` field whatsoever, so inventing one would hand the agent a
+    plugin its own client never asks for.
     """
-    surface = _agent_surface(agent) or _surface(work_iq)
+    agent_surface = _agent_surface(agent)
+    if agent_surface is not None:
+        # None (never sent the field) and [] (sent it empty) are different things.
+        if agent_surface.plugins is None:
+            return None
+        return [dict(p) for p in agent_surface.plugins]
+
+    surface = _surface(work_iq)
     if surface is not None and surface.plugins is not None:
         return [dict(p) for p in surface.plugins]
     return [dict(BING_PLUGIN)]
@@ -416,9 +430,10 @@ def tone_for_model(model: str | None) -> str | None:
     fall back to the GPT tone — it would serve GPT under a Claude name. Route it to
     the Claude tone instead; everything else gets the default.
 
-    An agent id resolves to whatever tone the real client sent for that agent, which
-    is often None — the agent UI has no model picker, and inventing a tone it never
-    sends is exactly the guess `capture` exists to avoid.
+    An agent id resolves to whatever tone the real client sent for that agent — a
+    captured work tenant sent `Chat` — or to None when it sent none. The agent UI has
+    no model picker, so there is nothing for a caller to choose; replaying what was
+    observed avoids exactly the guess `capture` exists to avoid.
     """
     if is_agent_id(model):
         agent = agent_for_model(model)

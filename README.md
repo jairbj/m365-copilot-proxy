@@ -256,19 +256,30 @@ uv run m365-copilot-proxy capture
 ```
 
 The agent's turn carries a `threadLevelGptId`, the opaque object that puts a thread
-inside it. That object is recorded whole and replayed unread, along with the rest of
-that connection's shape, under `agents` in `profile.json`:
+inside it — and the same id again as a `gptId` field in the connection's query.
+Sending only one of the two does not enter the agent, which is why the whole
+connection is recorded, unread, under `agents` in `profile.json`:
 
 ```json
 {
   "agents": {
     "agent-1": {
-      "thread_level_gpt_id": { "...": "opaque" },
-      "surface": { "query": { "agent": "work" }, "option_sets": ["..."] }
+      "thread_level_gpt_id": { "id": "T_….gpt.1ce6ba88-…@MOS3", "source": "MOS3" },
+      "surface": {
+        "query": { "gptId": "T_….gpt.1ce6ba88-…@MOS3", "agent": "Agent" },
+        "option_sets": ["..."],
+        "plugins": null
+      },
+      "tone": "Chat"
     }
   }
 }
 ```
+
+Note `agent: "Agent"` — the Work IQ surface field takes a third value here, neither
+`work` nor `web`, so an agent is filed on its own rather than overwriting either.
+`XRoutingParameterSessionKey` is recorded too when the connection carries it, but
+never replayed: it names one session, and each conversation mints its own.
 
 Rename `agent-1` to whatever you like — the name is not on the wire, and a later
 capture recognises the agent by its id, so the rename survives.
@@ -285,9 +296,12 @@ curl -N http://127.0.0.1:8765/v1/chat/completions \
 client's model picker next to the ordinary ids.
 
 **What an agent does not have.** The agent UI offers no model selector and no Work
-IQ toggle, so neither does the proxy here: an `agent:` id takes no `-work` suffix,
-and no `tone` is sent for it — whatever model and grounding the agent was built with
-is what you get. An `agent:` id that was never captured fails the turn rather than
+IQ toggle, so neither does the proxy here: an `agent:` id takes no `-work` suffix and
+no choice of model — whatever the agent was built with is what you get. It does still
+send a `tone` (a captured work tenant sent `Chat`), and whatever that turned out to
+be is replayed as recorded, along with the rest of the turn: an agent seen sending no
+`plugins` field is sent none, rather than being handed the Bing plugin its own client
+never asks for. An `agent:` id that was never captured fails the turn rather than
 quietly serving plain Copilot under the agent's name.
 
 Because the agent carries the instructions, an agent turn does **not** repeat the

@@ -105,8 +105,10 @@ def build_chat_invocation(
     plain chat ignores the ones we inline. It is opaque: `capture` records the object
     the real client sends and this replays it unread. Empty means plain Copilot.
 
-    `tone` is None for an agent, whose UI has no model picker: the field is then left
-    out of the invocation entirely rather than filled with a guess.
+    `tone` and `plugin_list` are left out of the invocation entirely when None, which
+    is how a real capture of an agent turn looks: it carries no `plugins` field at all.
+    What to send instead of nothing is `protocol`'s decision, not this function's — the
+    default belongs in one place, next to the surfaces it describes.
     """
     argument: dict[str, Any] = {
         "source": source,
@@ -136,15 +138,12 @@ def build_chat_invocation(
             "adaptiveCards": [],
             "clientPreferences": {},
         },
-        "plugins": (
-            [dict(p) for p in plugin_list]
-            if plugin_list is not None
-            else [dict(protocol.BING_PLUGIN)]
-        ),
         "isSbsSupported": True,
         "renderReferencesBehindEOS": True,
         "disconnectBehavior": "continue",
     }
+    if plugin_list is not None:
+        argument["plugins"] = [dict(p) for p in plugin_list]
     if tone is not None:
         argument["tone"] = tone
     return {

@@ -300,6 +300,22 @@ class TestDeclarativeAgents:
         # The connection is replayed as recorded, not merged with a Work IQ choice.
         assert protocol.query_defaults(True, agent) == AGENT["surface"]["query"]
 
+    def test_an_agent_that_sends_no_plugins_gets_none_invented_for_it(self):
+        # A real capture shows no `plugins` field on an agent turn. A surface with
+        # none recorded still falls back to Bing, which is what a plain turn sends.
+        surface = {k: v for k, v in AGENT["surface"].items() if k != "plugins"}
+        plugin_less = {**AGENT, "surface": surface}
+        write_profile({"agents": {"b": plugin_less}, "surfaces": {"web": WEB_SURFACE}})
+
+        assert protocol.plugins(agent=protocol.agent_for_model("agent:b")) is None
+        assert protocol.plugins(False) == [protocol.BING_PLUGIN]
+
+    def test_an_agent_that_sends_an_empty_plugin_list_sends_one(self):
+        # Empty is a thing the client said; absent is a thing it never sent.
+        write_profile({"agents": {"b": {**AGENT, "surface": {**AGENT["surface"], "plugins": []}}}})
+
+        assert protocol.plugins(agent=protocol.agent_for_model("agent:b")) == []
+
     def test_an_agent_id_carries_no_tone_of_its_own_making(self):
         write_profile({"agents": {"b": AGENT}})
 

@@ -23,7 +23,7 @@ from m365_copilot_proxy import tls
 from m365_copilot_proxy.auth.tokens import decode_jwt, redact
 from m365_copilot_proxy.bizchat import frames, protocol
 from m365_copilot_proxy.bizchat.images import GeneratedImage, capture_images
-from m365_copilot_proxy.bizchat.profile import DeclarativeAgent
+from m365_copilot_proxy.bizchat.profile import REFRESHED_QUERY_KEYS, DeclarativeAgent
 from m365_copilot_proxy.config import get_settings
 
 log = logging.getLogger(__name__)
@@ -75,6 +75,10 @@ class CopilotSession:
     ) -> None:
         self.session_id = session_id or str(uuid.uuid4())
         self.conversation_id = conversation_id or str(uuid.uuid4())
+        #: Substrate's routing affinity key, sent only by connections observed to
+        #: carry it (an agent's, so far). It belongs to a session, so it lives and
+        #: dies with the conversation rather than being replayed from a capture.
+        self.routing_session_key = str(uuid.uuid4())
         self.turn_count = 0
         #: Server-reported usage of the 600-message conversation budget.
         self.messages_used = 0
@@ -82,6 +86,7 @@ class CopilotSession:
     def reset_conversation(self) -> None:
         """Start a brand-new server-side conversation, keeping this object."""
         self.conversation_id = str(uuid.uuid4())
+        self.routing_session_key = str(uuid.uuid4())
         self.turn_count = 0
         self.messages_used = 0
         log.info("Rotated to a new conversation: cid=%s", self.conversation_id)
@@ -103,6 +108,9 @@ class CopilotSession:
             "variants": protocol.variants(work_iq, agent),
             **protocol.query_defaults(work_iq, agent),
         }
+        # A captured session key is a record of one session, not a setting to reuse.
+        for key in REFRESHED_QUERY_KEYS & query.keys():
+            query[key] = self.routing_session_key
         return (
             f"wss://{protocol.WS_HOST}{protocol.WS_PATH}/"
             f"{claims.chathub_path}?{urlencode(query)}"

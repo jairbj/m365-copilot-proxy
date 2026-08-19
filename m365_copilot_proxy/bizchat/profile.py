@@ -63,6 +63,12 @@ PER_CONNECTION_QUERY_KEYS = frozenset(
     {"access_token", "chatsessionid", "clientrequestid", "X-SessionId", "ConversationId"}
 )
 
+#: Recorded fields that name a session rather than a setting. The capture keeps the
+#: value it saw — it is evidence that this connection carries the field at all — but
+#: replaying it would pin every future conversation to a session that ended when the
+#: capture window closed, so the value is minted fresh per conversation instead.
+REFRESHED_QUERY_KEYS = frozenset({"XRoutingParameterSessionKey"})
+
 
 @dataclass
 class Surface:
@@ -113,15 +119,18 @@ class DeclarativeAgent:
 
     The field that selects one (`threadLevelGptId`) is opaque and undocumented, so
     nothing here interprets it: capture records what the real client sent and the
-    session replays it verbatim. An agent also brings its own surface — it has no
-    model picker and no Work IQ toggle, so its `tone` is whatever the client sent
-    (often nothing at all) rather than something the caller chooses.
+    session replays it verbatim. The id shows up in the connection's query too, which
+    is why the whole surface is kept rather than only the invocation.
+
+    An agent has no model picker and no Work IQ toggle, so its `tone` is whatever its
+    own client was seen sending — `Chat`, on the tenant this was captured from — and
+    not something the caller chooses.
     """
 
     surface: Surface = field(default_factory=Surface)
     thread_level_gpt_id: dict[str, Any] = field(default_factory=dict)
     extra_extension_parameters: dict[str, Any] = field(default_factory=dict)
-    #: None means the client sent no tone for this agent — so neither do we.
+    #: The tone the agent's own client sends. None means it sent none, and so do we.
     tone: str | None = None
     source: str | None = None
 

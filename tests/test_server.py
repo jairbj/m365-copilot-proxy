@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -262,8 +263,6 @@ async def test_the_work_suffix_reaches_the_wire_and_keeps_the_tone(
         "/v1/chat/completions",
         json={"model": "gpt-5.5-work", "messages": [{"role": "user", "content": "hi"}]},
     )
-    from urllib.parse import parse_qs, urlparse
-
     assert parse_qs(urlparse(fake.urls[0]).query)["agent"] == ["work"]
     # The suffix must not leak into the tone lookup.
     from m365_copilot_proxy.bizchat import protocol
@@ -300,6 +299,40 @@ async def test_health_reports_the_conversation_count(client: httpx.AsyncClient):
 # --- Declarative agents ------------------------------------------------------
 
 
+#: The agent id, exactly as a real work tenant sends it.
+GPT_ID = "T_ee433d1f-0020-fb71-0e6e-64942eccb480.gpt.1ce6ba88-1509-4424-b7f2-91865ca8ce98@MOS3"
+
+#: The session key that capture happened to see. It must never reach the wire.
+CAPTURED_SESSION_KEY = "0fa68510-6474-4ce6-a265-852d93b216ab"
+
+#: One agent, shortened from a real capture and otherwise unedited — the surface
+#: field reads `Agent` (neither `work` nor `web`), the id appears in the query as
+#: well as in the invocation, a tone IS sent, and no `plugins` field is.
+REAL_AGENT = {
+    "surface": {
+        "query": {
+            "XRoutingParameterSessionKey": CAPTURED_SESSION_KEY,
+            "gptId": GPT_ID,
+            "source": '"officeweb"',
+            "product": "Office",
+            "agentHost": "Bizchat.FullScreen",
+            "licenseType": "Premium",
+            "isEdu": "false",
+            "agent": "Agent",
+            "scenario": "officeweb",
+            "variants": "feature.agent",
+        },
+        "option_sets": ["at_mention_plugins_enable", "enterprise_flux_work"],
+        "allowed_message_types": ["Chat", "EndOfRequest"],
+        "plugins": None,
+    },
+    "thread_level_gpt_id": {"id": GPT_ID, "source": "MOS3"},
+    "extra_extension_parameters": {},
+    "tone": "Chat",
+    "source": "officeweb",
+}
+
+
 @pytest.fixture
 def captured_agent(tmp_path, monkeypatch):
     """A profile holding one captured agent, isolated from the real config dir."""
@@ -313,22 +346,7 @@ def captured_agent(tmp_path, monkeypatch):
     tenant_profile.reset_cache()
     tmp_path.mkdir(parents=True, exist_ok=True)
     tenant_profile.profile_path().write_text(
-        json.dumps(
-            {
-                "agents": {
-                    "sales-bot": {
-                        "surface": {
-                            "query": {"agent": "work", "scenario": "officeweb"},
-                            "option_sets": ["agent_set"],
-                            "allowed_message_types": ["Chat"],
-                        },
-                        "thread_level_gpt_id": {"gptId": "agent-guid"},
-                        "extra_extension_parameters": {"k": "v"},
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
+        json.dumps({"agents": {"sales-bot": REAL_AGENT}}), encoding="utf-8"
     )
     tenant_profile.reset_cache()
     yield "agent:sales-bot"
@@ -363,13 +381,43 @@ async def test_an_agent_turn_carries_its_id_and_drops_the_system_block(
     )
 
     arguments = fake.chat_arguments
-    assert arguments["threadLevelGptId"] == {"gptId": "agent-guid"}
-    assert arguments["extraExtensionParameters"] == {"k": "v"}
-    assert arguments["optionsSets"] == ["agent_set"]
+    assert arguments["threadLevelGptId"] == {"id": GPT_ID, "source": "MOS3"}
+    assert arguments["optionsSets"] == ["at_mention_plugins_enable", "enterprise_flux_work"]
     # The agent carries the instructions itself, and honours them.
     assert arguments["message"]["text"] == "hello"
-    # No model picker in the agent UI, so no tone is invented for it.
-    assert "tone" not in arguments
+    # Replayed as captured: the agent UI sends a tone, it just does not offer a choice.
+    assert arguments["tone"] == "Chat"
+    # It sends no `plugins` field at all, so neither do we — handing an agent the
+    # Bing plugin its own client never asks for is a change to how it answers.
+    assert "plugins" not in arguments
+
+    query = parse_qs(urlparse(fake.urls[0]).query)
+    # The id identifies the thread in two places; only replaying both enters the agent.
+    assert query["gptId"] == [GPT_ID]
+    assert query["agent"] == ["Agent"]
+
+
+async def test_the_captured_session_key_is_never_replayed(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    # `XRoutingParameterSessionKey` names a session, and the one capture saw ended
+    # when the browser window closed. Each conversation mints its own.
+    import uuid
+
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    for opening in ("first thread", "second thread"):
+        await client.post(
+            "/v1/chat/completions",
+            json={"model": captured_agent, "messages": [{"role": "user", "content": opening}]},
+        )
+
+    keys = [parse_qs(urlparse(url).query)["XRoutingParameterSessionKey"][0] for url in fake.urls]
+    assert CAPTURED_SESSION_KEY not in keys
+    assert len(set(keys)) == 2
+    for key in keys:
+        uuid.UUID(key)  # raises if it is not one
 
 
 async def test_an_agent_turn_sends_the_tool_list_without_the_contract(

@@ -186,8 +186,8 @@ class ProfileCollector:
         source = argument.get("source")
         if isinstance(source, str) and source:
             agent.source = source
-        # The agent UI has no model picker: whatever tone it sends (often none) is
-        # the only correct one, so an absent tone is recorded as absent.
+        # The agent UI has no model picker, so whatever tone it sends is the only
+        # correct one — and an absent tone is recorded as absent, not filled in.
         tone = argument.get("tone")
         agent.tone = tone if isinstance(tone, str) and tone else None
         return seen

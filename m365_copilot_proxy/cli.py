@@ -187,7 +187,7 @@ def capture(
         typer.echo(f"Agents ({len(captured.agents)}):")
         for slug in sorted(captured.agents):
             typer.echo(f"  {protocol.AGENT_ID_PREFIX}{slug}")
-        typer.echo("An agent brings its own model and grounding: no tone, no Work IQ.")
+        typer.echo("An agent brings its own model and grounding — neither is selectable.")
         typer.echo("Paste its instructions with `m365-copilot-proxy prompt`.")
 
     if recorder is not None and recorder.count:
