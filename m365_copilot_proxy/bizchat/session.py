@@ -141,6 +141,15 @@ class CopilotSession:
         is_first = self.turn_count == 0
         self.turn_count += 1
 
+        if agent is not None and not agent.raw_argument:
+            # Without the full invocation the turn reaches the agent's thread but is
+            # answered by plain Copilot, which is a failure that looks like a success.
+            log.warning(
+                "Agent captured before the whole invocation was recorded — its "
+                "instructions will be ignored. Re-run `m365-copilot-proxy capture` "
+                "and send the agent a message."
+            )
+
         options_sets = protocol.option_sets(
             work_iq=work_iq, generate_images=generate_images, agent=agent
         )
@@ -319,6 +328,7 @@ class CopilotSession:
             plugin_list=plugin_list,
             thread_level_gpt_id=agent.thread_level_gpt_id if agent else None,
             extra_extension_parameters=agent.extra_extension_parameters if agent else None,
+            template=agent.raw_argument if agent else None,
             source=(agent.source if agent and agent.source else "officeweb"),
         )
         metrics = frames.build_metrics()

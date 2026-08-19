@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import sys
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -96,6 +97,8 @@ class ProfileCollector:
     _buffers: dict[int, str] = field(default_factory=dict, repr=False)
     #: The query each live socket was opened with, minus the per-connection fields.
     _socket_query: dict[int, dict[str, str]] = field(default_factory=dict, repr=False)
+    #: Unfamiliar invocation fields already reported, so each is mentioned once.
+    _reported_fields: set[str] = field(default_factory=set, repr=False)
 
     @property
     def observations(self) -> int:
@@ -168,9 +171,11 @@ class ProfileCollector:
     ) -> list[Observation]:
         """File a turn that ran inside a declarative agent.
 
-        Everything is kept whole and unread: which field of `threadLevelGptId`
-        identifies the agent is undocumented, so the object is replayed exactly as
-        the real client sent it.
+        The whole invocation is kept, not a chosen list of fields. Replaying only the
+        fields someone thought of reached the agent's thread but was answered by plain
+        Copilot: whatever asks for the agent's instructions is something else in there.
+        So the argument is stored as a template, and any field in it the proxy does not
+        build itself is reported — that report is the point of re-capturing.
         """
         slug = self._slug_for(gpt_id)
         seen = [] if slug in self.agents else [Observation("agent", slug)]
@@ -179,6 +184,7 @@ class ProfileCollector:
         agent.thread_level_gpt_id = dict(gpt_id)
         agent.surface.query.update(self._socket_query.get(socket_id, {}))
         _absorb_surface(agent.surface, argument)
+        agent.raw_argument = strip_per_turn_fields(argument)
 
         extras = argument.get("extraExtensionParameters")
         if isinstance(extras, dict):
@@ -190,6 +196,11 @@ class ProfileCollector:
         # correct one — and an absent tone is recorded as absent, not filled in.
         tone = argument.get("tone")
         agent.tone = tone if isinstance(tone, str) and tone else None
+
+        for name in sorted(set(argument) - MANAGED_ARGUMENT_KEYS):
+            if name not in self._reported_fields:
+                self._reported_fields.add(name)
+                seen.append(Observation("field", name))
         return seen
 
     def _slug_for(self, gpt_id: dict[str, Any]) -> str:
@@ -212,6 +223,62 @@ class ProfileCollector:
             tones=dict(self.tones),
             agents={name: a for name, a in self.agents.items() if not a.is_empty},
         )
+
+
+#: Invocation fields the proxy builds for itself on every turn. Anything an agent
+#: sends outside this set is news — and news is what re-capturing is for.
+MANAGED_ARGUMENT_KEYS = frozenset(
+    {
+        "source",
+        "clientCorrelationId",
+        "sessionId",
+        "optionsSets",
+        "streamingMode",
+        "spokenTextMode",
+        "options",
+        "extraExtensionParameters",
+        "allowedMessageTypes",
+        "sliceIds",
+        "threadLevelGptId",
+        "traceId",
+        "isStartOfSession",
+        "clientInfo",
+        "message",
+        "plugins",
+        "isSbsSupported",
+        "tone",
+        "renderReferencesBehindEOS",
+        "disconnectBehavior",
+    }
+)
+
+#: Argument fields that belong to one turn and are regenerated for every later one.
+_PER_TURN_KEYS = ("clientCorrelationId", "sessionId", "traceId", "isStartOfSession")
+
+#: The same, inside `message`. `text` is the user's own message: it must not be
+#: written to a config file, and it would be overwritten on replay anyway.
+_PER_TURN_MESSAGE_KEYS = ("text", "requestId")
+
+
+def strip_per_turn_fields(argument: dict[str, Any]) -> dict[str, Any]:
+    """A copy of an invocation with everything turn-specific taken out.
+
+    What is left is a template: the shape of the client's request, without the ids of
+    the turn that carried it or the words the user happened to type.
+    """
+    template = deepcopy(argument)
+    for key in _PER_TURN_KEYS:
+        template.pop(key, None)
+
+    message = template.get("message")
+    if isinstance(message, dict):
+        for key in _PER_TURN_MESSAGE_KEYS:
+            message.pop(key, None)
+
+    client_info = template.get("clientInfo")
+    if isinstance(client_info, dict):
+        client_info.pop("clientSessionId", None)
+    return template
 
 
 def _absorb_surface(surface: Surface, argument: dict[str, Any]) -> None:
@@ -239,6 +306,8 @@ def describe(observation: Observation) -> str:
             f"declarative agent captured  ->  model id "
             f"`{protocol.AGENT_ID_PREFIX}{observation.name}`"
         )
+    if observation.kind == "field":
+        return f"the agent also sends `{observation.name}` — recorded, and replayed with it"
     return f"recording the '{observation.name}' surface"
 
 

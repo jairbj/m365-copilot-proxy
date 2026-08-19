@@ -125,6 +125,12 @@ class DeclarativeAgent:
     An agent has no model picker and no Work IQ toggle, so its `tone` is whatever its
     own client was seen sending — `Chat`, on the tenant this was captured from — and
     not something the caller chooses.
+
+    Recording a chosen list of fields turned out not to be enough: a turn replayed
+    from those alone reaches the agent's thread but is answered by plain Copilot,
+    which ignores the agent's instructions. Whatever asks for them is a field nobody
+    thought to record. So `raw_argument` keeps the WHOLE invocation the client sent,
+    minus the parts that belong to one turn, and the session replays it as a template.
     """
 
     surface: Surface = field(default_factory=Surface)
@@ -133,6 +139,9 @@ class DeclarativeAgent:
     #: The tone the agent's own client sends. None means it sent none, and so do we.
     tone: str | None = None
     source: str | None = None
+    #: The complete captured invocation, per-turn fields stripped. Empty for a profile
+    #: captured before this existed — re-run `capture` to fill it in.
+    raw_argument: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -146,6 +155,7 @@ class DeclarativeAgent:
             "extra_extension_parameters": self.extra_extension_parameters,
             "tone": self.tone,
             "source": self.source,
+            "raw_argument": self.raw_argument,
         }
 
     @classmethod
@@ -159,6 +169,7 @@ class DeclarativeAgent:
             extra_extension_parameters=_json_map(data.get("extra_extension_parameters")),
             tone=tone if isinstance(tone, str) and tone else None,
             source=source if isinstance(source, str) and source else None,
+            raw_argument=_json_map(data.get("raw_argument")),
         )
 
 

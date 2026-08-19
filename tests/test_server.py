@@ -330,6 +330,15 @@ REAL_AGENT = {
     "extra_extension_parameters": {},
     "tone": "Chat",
     "source": "officeweb",
+    # The whole invocation, kept because replaying a chosen subset of it reached the
+    # agent's thread and was still answered by plain Copilot.
+    "raw_argument": {
+        "source": "officeweb",
+        "streamingMode": "Delta",
+        "threadLevelGptId": {"id": GPT_ID, "source": "MOS3"},
+        "clientInfo": {"clientPlatform": "mcmcopilot-web", "clientAppName": "Office"},
+        "message": {"author": "user", "experienceType": "Agent"},
+    },
 }
 
 
@@ -395,6 +404,28 @@ async def test_an_agent_turn_carries_its_id_and_drops_the_system_block(
     # The id identifies the thread in two places; only replaying both enters the agent.
     assert query["gptId"] == [GPT_ID]
     assert query["agent"] == ["Agent"]
+
+
+async def test_the_agent_turn_is_shaped_like_the_captured_one(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    # Everything the client sends and this code does not build for itself has to
+    # survive, since that is where the agent's instructions are asked for.
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    arguments = fake.chat_arguments
+    assert arguments["streamingMode"] == "Delta"
+    assert arguments["message"]["experienceType"] == "Agent"
+    # …while the turn keeps its own text and ids.
+    assert arguments["message"]["text"] == "hello"
+    assert arguments["message"]["requestId"] == arguments["traceId"]
+    assert arguments["clientInfo"]["clientSessionId"]
 
 
 async def test_the_captured_session_key_is_never_replayed(

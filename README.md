@@ -257,8 +257,11 @@ uv run m365-copilot-proxy capture
 
 The agent's turn carries a `threadLevelGptId`, the opaque object that puts a thread
 inside it — and the same id again as a `gptId` field in the connection's query.
-Sending only one of the two does not enter the agent, which is why the whole
-connection is recorded, unread, under `agents` in `profile.json`:
+Sending only one of the two does not enter the agent, and sending only the fields
+someone thought to record enters the thread but is still answered by plain Copilot:
+whatever asks for the agent's instructions is a field nobody knew to look for. So the
+whole connection **and the whole invocation** are recorded, unread, under `agents` in
+`profile.json`:
 
 ```json
 {
@@ -270,11 +273,17 @@ connection is recorded, unread, under `agents` in `profile.json`:
         "option_sets": ["..."],
         "plugins": null
       },
-      "tone": "Chat"
+      "tone": "Chat",
+      "raw_argument": { "…": "the whole invocation, minus this turn's ids and text" }
     }
   }
 }
 ```
+
+`raw_argument` is the template every agent turn is built from: it wins over this
+proxy's own defaults, and only the text, the ids and the session are written over the
+top. Capture prints each field in it that the proxy would not have sent by itself —
+those lines are worth reading, they are what the agent needs and plain chat does not.
 
 Note `agent: "Agent"` — the Work IQ surface field takes a third value here, neither
 `work` nor `web`, so an agent is filed on its own rather than overwriting either.
@@ -294,6 +303,10 @@ curl -N http://127.0.0.1:8765/v1/chat/completions \
 
 `GET /v1/models` lists every captured agent as `agent:<name>`, so it shows up in a
 client's model picker next to the ordinary ids.
+
+An agent captured before `raw_argument` existed still enters the thread but gets
+plain-Copilot answers; the log says so on every turn. Re-run `capture`, send the
+agent one message, and the entry fills itself in — the name you gave it survives.
 
 **What an agent does not have.** The agent UI offers no model selector and no Work
 IQ toggle, so neither does the proxy here: an `agent:` id takes no `-work` suffix and

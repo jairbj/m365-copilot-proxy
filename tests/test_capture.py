@@ -252,3 +252,64 @@ def test_build_produces_a_saveable_profile():
     # Tones are shared, surfaces are not.
     assert profile.tones == {"claude-sonnet": "Claude_Sonnet"}
     assert profile.surfaces["work"].query["agent"] == "work"
+
+
+class TestTheWholeInvocation:
+    """Recording every field, because the ones that mattered were unrecorded."""
+
+    def test_the_whole_argument_is_kept_as_a_template(self):
+        collector = ProfileCollector()
+        collector.note_frame_payload(
+            1,
+            chat_frame(
+                "Chat",
+                threadLevelGptId={"id": "x"},
+                gptDefinition={"instructions": "be terse"},
+                streamingMode="Delta",
+            ),
+        )
+
+        template = collector.agents["agent-1"].raw_argument
+        assert template["gptDefinition"] == {"instructions": "be terse"}
+        assert template["streamingMode"] == "Delta"
+
+    def test_an_unfamiliar_field_is_reported_once(self):
+        # This report is the whole point of re-capturing: it names the field that
+        # was missing when the agent's instructions went unheeded.
+        collector = ProfileCollector()
+        frame = chat_frame("Chat", threadLevelGptId={"id": "x"}, gptDefinition={"a": 1})
+
+        seen = collector.note_frame_payload(1, frame)
+        assert ("field", "gptDefinition") in [(o.kind, o.name) for o in seen]
+        assert collector.note_frame_payload(1, frame) == []
+
+    def test_what_belongs_to_one_turn_is_not_kept(self):
+        # The captured message is something the user typed into their own chat.
+        collector = ProfileCollector()
+        collector.note_frame_payload(
+            1,
+            frames.encode(
+                {
+                    "type": 4,
+                    "target": "chat",
+                    "invocationId": "0",
+                    "arguments": [
+                        {
+                            "threadLevelGptId": {"id": "x"},
+                            "message": {"text": "my private question", "requestId": "r-1"},
+                            "clientInfo": {"clientSessionId": "s-1", "deviceOS": "Linux"},
+                            "clientCorrelationId": "r-1",
+                            "sessionId": "s-1",
+                            "traceId": "r-1",
+                            "isStartOfSession": True,
+                        }
+                    ],
+                }
+            ),
+        )
+
+        template = collector.agents["agent-1"].raw_argument
+        assert "my private question" not in json.dumps(template)
+        assert set(template) == {"threadLevelGptId", "message", "clientInfo"}
+        assert template["message"] == {}
+        assert template["clientInfo"] == {"deviceOS": "Linux"}
