@@ -58,6 +58,7 @@ uv run m365-copilot-proxy login    # opens a browser; complete SSO/MFA yourself
 uv run m365-copilot-proxy status   # confirms silent refresh works
 uv run m365-copilot-proxy capture  # learns your tenant's models — see below
 uv run m365-copilot-proxy prompt   # the instructions to paste into an agent
+uv run m365-copilot-proxy priming  # the opening exchange for a new conversation
 uv run m365-copilot-proxy serve    # http://127.0.0.1:8765/v1
 ```
 
@@ -314,6 +315,72 @@ client's model picker next to the ordinary ids.
 An agent captured before `raw_argument` existed still enters the thread but gets
 plain-Copilot answers; the log says so on every turn. Re-run `capture`, send the
 agent one message, and the entry fills itself in — the name you gave it survives.
+
+### Priming: teaching a conversation before using it
+
+An agent honours its instructions but does not always act on them — it answers a
+question that needed a tool instead of calling one. Saying so in a message fixes it:
+
+> Quando for ler ou gravar arquivos ou executar comandos, sempre use as ferramentas do
+> seu prompt de agente ou as que eu te passar.
+
+So the proxy can send that as its own turn at the start of every new conversation, and
+**check the answer** before any real work goes in. Write the script once:
+
+```bash
+uv run m365-copilot-proxy priming --init     # writes <config_dir>/priming.json
+uv run m365-copilot-proxy priming            # shows it rendered, as the model will see it
+```
+
+```json
+{
+  "attempts": 3,
+  "on_failure": "fail",
+  "models": {
+    "agent:agent-1": [
+      {
+        "label": "use the tools",
+        "text": "Sempre use as ferramentas.\n\n{{tools_prompt}}\n\nSe entendeu, responda apenas \"agente-ok\".",
+        "expect": "agente-ok"
+      }
+    ]
+  }
+}
+```
+
+* **`models`** decides who is primed. A model id gets its own list; `"*"` catches the
+  rest; a model in neither is not primed. An explicit `[]` means "not this one",
+  and beats the `"*"` fallback.
+* **A step** is `text` plus, optionally, `expect` (case-insensitive substring),
+  `expect_regex`, and a `label` for the logs. A step with no check is sent and not
+  verified.
+* **`attempts`** is how many conversations to try. A conversation that answers wrongly
+  has that answer in its context, so a retry starts a fresh one and runs the script
+  from the top.
+* **`on_failure`** is `fail` (default — a 502 naming the step and quoting the answer)
+  or `continue` (send the turn anyway and log it).
+
+**Placeholders**, filled per request: `{{tools_prompt}}` (the client's current tool
+list), `{{system_prompt}}`, `{{contract}}`, `{{user_message}}`. An unknown one is left
+as written and logged rather than silently dropped, and a step that renders empty is
+skipped — so `{{tools_prompt}}` costs nothing when the client declared no tools.
+
+`{{tools_prompt}}` is what lets an agent stay generic. Put the tool list here and it
+arrives fresh with every conversation, instead of being frozen into the agent's
+instructions where it goes stale the moment the client's toolset changes.
+
+**What it costs.** Every step is a real turn: one of the conversation's 600 messages
+and one round trip, and a retry spends them again. Two steps at three attempts is six
+messages before the user's first word. The proxy opens the response immediately and
+primes in the gap, so a client waiting on the first chunk does not see a stall.
+
+`M365_PRIMING=0` disables the whole thing without editing the file — useful for
+telling "the model ignores its tools" apart from "my script is wrong".
+
+**The discarded conversations stay in your Copilot history.** Nothing in the captured
+protocol deletes a chat, so a rejected one is abandoned, not removed; the log says so
+each time. If you want them cleaned up, `capture --record-api` while deleting a chat
+in the web UI records the call that does it.
 
 **What an agent does not have.** The agent UI offers no model selector and no Work
 IQ toggle, so neither does the proxy here: an `agent:` id takes no `-work` suffix and
@@ -611,6 +678,7 @@ Everything is settable through `M365_*` environment variables or a `.env` file:
 | `M365_WORK_IQ` | `false` | Ground answers in work content by default |
 | `M365_RECORD_SYSTEM_PROMPTS` | `true` | Keep each conversation's system prompt for `prompt` |
 | `M365_AGENT_SEND_SYSTEM` | `false` | Send the system block and tool contract on an agent turn |
+| `M365_PRIMING` | `true` | Run `priming.json` on every new conversation |
 | `M365_DUMP_FRAMES` | `false` | Write every SignalR frame to `<config_dir>/frames/` |
 | `M365_LOG_LEVEL` | `INFO` | Logging level |
 

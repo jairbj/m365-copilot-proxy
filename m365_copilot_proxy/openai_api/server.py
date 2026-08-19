@@ -6,12 +6,13 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from functools import partial
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from m365_copilot_proxy import agent_instructions, tls
+from m365_copilot_proxy import agent_instructions, priming, tls
 from m365_copilot_proxy.auth.tokens import (
     NeedsLoginError,
     TlsTrustError,
@@ -38,7 +39,11 @@ from m365_copilot_proxy.openai_api.schemas import (
     Usage,
     estimate_tokens,
 )
-from m365_copilot_proxy.openai_api.tools import format_tool_instructions, parse_tool_calls
+from m365_copilot_proxy.openai_api.tools import (
+    TOOL_CONTRACT,
+    format_tool_instructions,
+    parse_tool_calls,
+)
 from m365_copilot_proxy.openai_api.translate import (
     build_turn_text,
     first_user_text,
@@ -249,6 +254,24 @@ async def run_completion(body: ChatCompletionRequest) -> object:
             result=result,
         )
 
+        # Only a conversation Copilot has never seen needs teaching; a live one has
+        # already been told, and telling it again would spend a message saying so.
+        steps = priming_steps(body, turn) if turn.is_new else []
+        if steps:
+            stream = _primed(
+                partial(
+                    priming.run,
+                    turn.session,
+                    token=token,
+                    steps=steps,
+                    script=priming.load(),
+                    model=base_model,
+                    work_iq=work_iq,
+                    agent=agent,
+                ),
+                stream,
+            )
+
         if body.stream:
             inner = (
                 buffered_stream(stream, result, body, turn, len(body.messages))
@@ -270,6 +293,44 @@ async def run_completion(body: ChatCompletionRequest) -> object:
     finally:
         if not lock_transferred:
             lock.release()
+
+
+async def _primed(
+    prime: Callable[[], Awaitable[None]], stream: AsyncIterator[str]
+) -> AsyncIterator[str]:
+    """Run the opening exchange, then the turn itself.
+
+    `session.chat()` is a generator whose body — the connection included — only runs
+    on first iteration, so wrapping it here is enough to put the priming turns first
+    without either SSE path knowing. Both of them emit their opening chunk before
+    touching this, so the client sees the response open while priming happens.
+    """
+    await prime()
+    async for chunk in stream:
+        yield chunk
+
+
+def priming_steps(body: ChatCompletionRequest, turn: PooledTurn) -> list[priming.Step]:
+    """The opening script for this request, with its placeholders filled.
+
+    Rendered per request rather than once at load time: `{{tools_prompt}}` is the
+    client's CURRENT tool list, which is the point of putting it here rather than
+    freezing it into an agent's instructions.
+    """
+    if not get_settings().priming:
+        return []
+    steps = priming.load().steps_for(body.model)
+    if not steps:
+        return []
+    return priming.rendered_steps(
+        steps,
+        {
+            "tools_prompt": format_tool_instructions(body.tools or [], include_contract=False),
+            "system_prompt": "\n\n".join(system_texts(body.messages)),
+            "contract": TOOL_CONTRACT,
+            "user_message": first_user_text(body.messages),
+        },
+    )
 
 
 async def _releasing(inner: AsyncIterator[str], lock: asyncio.Lock) -> AsyncIterator[str]:

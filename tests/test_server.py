@@ -583,3 +583,178 @@ async def test_the_system_prompt_endpoint_says_when_there_is_nothing_yet(
 
     assert response.status_code == 404
     assert "No system prompt recorded" in response.json()["error"]["message"]
+
+
+# --- Priming: a scripted opening exchange ------------------------------------
+
+
+def chat_invocations(fake) -> list[dict]:
+    return [f["arguments"][0] for f in fake.received if f.get("target") == "chat"]
+
+
+def sent_texts(fake) -> list[str]:
+    return [a["message"]["text"] for a in chat_invocations(fake)]
+
+
+def conversation_ids(fake) -> list[str]:
+    return [parse_qs(urlparse(url).query)["ConversationId"][0] for url in fake.urls]
+
+
+@pytest.fixture
+def priming_script(tmp_path, monkeypatch):
+    """Write a priming script into the same isolated config dir the agent uses."""
+    import json as json_module
+
+    from m365_copilot_proxy import priming
+
+    monkeypatch.setenv("M365_CONFIG_DIR", str(tmp_path))
+
+    def write(script: dict) -> None:
+        from m365_copilot_proxy.config import get_settings
+
+        get_settings.cache_clear()
+        priming.config_path().parent.mkdir(parents=True, exist_ok=True)
+        priming.config_path().write_text(json_module.dumps(script), encoding="utf-8")
+        priming.reset_cache()
+
+    yield write
+    priming.reset_cache()
+
+
+async def test_a_primed_conversation_is_taught_before_it_is_used(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script(
+        {
+            "models": {
+                captured_agent: [
+                    {"text": "always use your tools\n\n{{tools_prompt}}", "expect": "agente-ok"}
+                ]
+            }
+        }
+    )
+    fake = await fake_bizchat([snapshot_frame("agente-ok"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "run_shell", "description": "run it"}}
+            ],
+        },
+    )
+
+    texts = sent_texts(fake)
+    assert len(texts) == 2
+    # The teaching comes first, carrying the client's CURRENT tool list…
+    assert texts[0].startswith("always use your tools")
+    assert "run_shell" in texts[0]
+    # …and the user's message follows it, in the same conversation.
+    assert texts[1] == "hello"
+    assert len(set(conversation_ids(fake))) == 1
+
+
+async def test_a_conversation_that_did_not_take_it_in_is_thrown_away(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script(
+        {
+            "attempts": 2,
+            "models": {captured_agent: [{"text": "always use your tools", "expect": "agente-ok"}]},
+        }
+    )
+    fake = await fake_bizchat([snapshot_frame("sure, whatever"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 502
+    message = response.json()["error"]["message"]
+    assert "agente-ok" in message and "sure, whatever" in message
+    # Two conversations tried, and the user's message never sent to either.
+    assert len(set(conversation_ids(fake))) == 2
+    assert "hello" not in sent_texts(fake)
+
+
+async def test_continue_sends_the_turn_even_though_priming_failed(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script(
+        {
+            "attempts": 2,
+            "on_failure": "continue",
+            "models": {captured_agent: [{"text": "always use your tools", "expect": "agente-ok"}]},
+        }
+    )
+    fake = await fake_bizchat([snapshot_frame("sure, whatever"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert sent_texts(fake)[-1] == "hello"
+
+
+async def test_a_model_the_script_does_not_name_is_left_alone(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script({"models": {"some-other-model": [{"text": "teach"}]}})
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert sent_texts(fake) == ["hello"]
+
+
+async def test_a_live_conversation_is_not_taught_twice(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    # The second request continues the same conversation, which has already been told.
+    priming_script({"models": {captured_agent: [{"text": "teach", "expect": "agente-ok"}]}})
+    fake = await fake_bizchat([snapshot_frame("agente-ok"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    first = [{"role": "user", "content": "hello"}]
+    await client.post("/v1/chat/completions", json={"model": captured_agent, "messages": first})
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [*first, {"role": "assistant", "content": "agente-ok"},
+                         {"role": "user", "content": "again"}],
+        },
+    )
+
+    assert sent_texts(fake) == ["teach", "hello", "again"]
+
+
+async def test_priming_can_be_turned_off_without_editing_the_script(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script({"models": {captured_agent: [{"text": "teach", "expect": "agente-ok"}]}})
+    monkeypatch.setenv("M365_PRIMING", "0")
+    from m365_copilot_proxy.config import get_settings
+
+    get_settings.cache_clear()
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert sent_texts(fake) == ["hello"]

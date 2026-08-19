@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import sys
@@ -13,9 +14,31 @@ import typer
 
 from m365_copilot_proxy import tls
 from m365_copilot_proxy.config import get_settings
+from m365_copilot_proxy.openai_api.tools import TOOL_CONTRACT
 
 if TYPE_CHECKING:
     from m365_copilot_proxy.agent_instructions import Document
+
+#: What `priming --init` writes: the message that was found to work by hand, with the
+#: tool list as a placeholder so it stays current instead of going stale in a file.
+STARTER_PRIMING = {
+    "attempts": 3,
+    "on_failure": "fail",
+    "models": {
+        "agent:agent-1": [
+            {
+                "label": "use the tools",
+                "text": (
+                    "Quando for ler ou gravar arquivos ou executar comandos, sempre use "
+                    "as ferramentas do seu prompt de agente ou as que eu te passar.\n\n"
+                    "{{tools_prompt}}\n\n"
+                    'Se você entendeu, responda apenas "agente-ok".'
+                ),
+                "expect": "agente-ok",
+            }
+        ]
+    },
+}
 
 cli = typer.Typer(
     add_completion=False,
@@ -298,6 +321,86 @@ def _report_size(document: Document) -> None:
         fg=typer.colors.YELLOW,
         err=True,
     )
+
+
+@cli.command()
+def priming(
+    model: str = typer.Option("", help="Which model's script to show. Default: the last used."),
+    init: bool = typer.Option(False, "--init", help="Write a starter priming.json."),
+) -> None:
+    """Show the opening exchange a new conversation will be primed with.
+
+    A declarative agent honours its instructions but does not always act on them. The
+    script says so in a turn of its own and checks the answer, so a conversation that
+    did not take it in is thrown away before any real work is sent to it.
+    """
+    from m365_copilot_proxy import agent_instructions
+    from m365_copilot_proxy import priming as priming_config
+
+    _setup_logging("WARNING")
+    path = priming_config.config_path()
+
+    if init:
+        if path.exists():
+            typer.secho(f"{path} already exists — not overwriting.", fg=typer.colors.RED, err=True)
+            raise typer.Exit(1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(STARTER_PRIMING, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        priming_config.reset_cache()
+        typer.echo(f"Wrote {path}")
+        typer.echo("Edit the text and the model id, then run `priming` to see it rendered.")
+        return
+
+    script = priming_config.load()
+    if not script.models:
+        typer.secho(
+            f"No priming script at {path}. Run `m365-copilot-proxy priming --init`.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    record = agent_instructions.latest()
+    target = model or (record.model if record else "") or priming_config.ANY_MODEL
+    steps = script.steps_for(target)
+    if not steps:
+        typer.secho(
+            f"Nothing primes `{target}`. Models in the script: "
+            f"{', '.join(sorted(script.models)) or 'none'}.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    # Rendered with the last real request's tools and prompt, so this is what the
+    # model would actually receive rather than a template with holes in it.
+    rendered = priming_config.rendered_steps(
+        steps,
+        {
+            "tools_prompt": record.tool_text if record else "",
+            "system_prompt": record.system_text if record else "",
+            "contract": TOOL_CONTRACT,
+            "user_message": "<the client's first message>",
+        },
+    )
+
+    typer.secho(
+        f"{target}: {len(rendered)} step(s), {script.attempts} attempt(s), "
+        f"on_failure={script.on_failure}",
+        err=True,
+    )
+    if record is None:
+        typer.secho(
+            "No request recorded yet, so {{tools_prompt}} and {{system_prompt}} are "
+            "empty here — they fill in for real at request time.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+    for index, step in enumerate(rendered, start=1):
+        typer.secho(f"\n--- step {index}/{len(rendered)} ({step.describe()}) ---", err=True)
+        typer.echo(step.text)
 
 
 @cli.command()
