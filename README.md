@@ -59,6 +59,7 @@ uv run m365-copilot-proxy status   # confirms silent refresh works
 uv run m365-copilot-proxy capture  # learns your tenant's models — see below
 uv run m365-copilot-proxy prompt   # the instructions to paste into an agent
 uv run m365-copilot-proxy priming  # the opening exchange for a new conversation
+uv run m365-copilot-proxy pi-config  # writes ~/.pi/agent/models.json
 uv run m365-copilot-proxy serve    # http://127.0.0.1:8765/v1
 ```
 
@@ -417,88 +418,23 @@ Use the `m365-copilot-image` model (or set `M365_IMAGES_ALWAYS=1`). Generated
 images come back as markdown with an inlined data URI, so any client can render
 them without a second authenticated fetch.
 
-## Using it with opencode
-
-Copy [`examples/opencode.json`](examples/opencode.json) to
-`~/.config/opencode/opencode.json` (applies everywhere) or to `opencode.json` in a
-project (applies there and wins over the global one). It ships every model in both
-surfaces — each id and its `-work` twin — so `/models` is ready to use as-is; the
-excerpt below is shortened:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "m365": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Microsoft 365 Copilot",
-      "options": {
-        "baseURL": "http://127.0.0.1:8765/v1",
-        "apiKey": "unused",
-        "timeout": 600000,
-        "chunkTimeout": 300000
-      },
-      "models": {
-        "claude-sonnet": {
-          "name": "M365 · Claude Sonnet",
-          "limit": { "context": 128000, "output": 16384 }
-        },
-        "gpt-5.6-think-deeper": {
-          "name": "M365 · GPT 5.6 Reasoning",
-          "limit": { "context": 128000, "output": 16384 }
-        }
-      }
-    }
-  },
-  "model": "m365/claude-sonnet",
-  "small_model": "m365/quick"
-}
-```
-
-Start the proxy (`uv run m365-copilot-proxy serve`), run `opencode`, and `/models`
-will list the `m365/*` entries. You do **not** need `/connect`: the key is inline,
-and the proxy ignores it anyway — it authenticates to Microsoft with your cached
-token.
-
-What the fields mean:
-
-* **`npm`** — `@ai-sdk/openai-compatible`, because this proxy speaks
-  `/v1/chat/completions`. (`@ai-sdk/openai` is for providers using `/v1/responses`.)
-* **`models`** — the ids must match what `GET /v1/models` returns. Use the ones your
-  `capture` run produced; the example lists the ones a work tenant typically offers.
-* **`limit`** — opencode pulls context sizes from models.dev for known providers,
-  but a custom one has to declare them or it cannot tell how much context is left.
-  The values here are estimates: Microsoft publishes no context window.
-* **`timeout` / `chunkTimeout`** — deliberately generous, see the streaming note
-  below.
-
-**Why `claude-sonnet` as the default.** In the reference implementation, the
-default GPT tone did not reliably call tools on real agentic tasks — it would
-confabulate that it had no shell instead of running one — while the Claude tone
-called them consistently. If your tenant behaves differently, any id from
-`/v1/models` works.
-
-### Caveats for agentic use
-
-* **Tool calls are emulated**, not native. The model is taught a fenced-block
-  contract in the prompt; it usually follows it, sometimes it doesn't. Expect the
-  occasional turn where it answers in prose instead of calling the tool.
-* **No incremental streaming when tools are declared** — which, in opencode, is
-  always. The proxy must see the whole reply before it can tell a tool call from
-  prose, so the answer arrives in one piece. It does open the stream immediately so
-  the connection is not mistaken for a stall, but a reasoning model can still take a
-  minute to reply; hence the generous `timeout`/`chunkTimeout`.
-* **The 600-message conversation budget goes fast.** Every opencode step — each tool
-  result, each follow-up — is one message. Long sessions will hit the rotation.
-* **No file or image input.** Non-text content parts are dropped, so dragging an
-  image into the chat sends only the text around it.
-
 ## Using it with pi
 
-[pi](https://pi.dev) reads custom providers from `~/.pi/agent/models.json`. Copy
-[`examples/pi-models.json`](examples/pi-models.json) there. Like the opencode one,
-it lists every model in both surfaces, so `/model` is ready to use as-is; the
-excerpt below is shortened:
+[pi](https://pi.dev) reads custom providers from `~/.pi/agent/models.json`, and the
+proxy can write that file for you:
+
+```bash
+uv run m365-copilot-proxy capture      # learn your tenant's models, once
+uv run m365-copilot-proxy pi-config    # write them into ~/.pi/agent/models.json
+```
+
+It lists the tones your capture actually saw — each with its `-work` twin — plus any
+declarative agent, and touches only the `m365` provider: anything else in that file is
+left alone. `--out` writes elsewhere, `--print` shows the result without writing it.
+
+If you have not captured yet, copy [`examples/pi-models.json`](examples/pi-models.json)
+there by hand instead. It describes one work tenant in August 2026, so the ids may not
+match yours; the excerpt below is shortened:
 
 ```json
 {
@@ -562,7 +498,8 @@ ever comes back, so pi would show a thinking UI that stays empty.
 
 ### Adding a declarative agent
 
-Agent ids are tenant-specific, so they are not in the shipped file — add the one
+`pi-config` already includes every agent your capture recorded, as
+`agent:<slug>`. If you are maintaining the file by hand instead, add the id
 `GET /v1/models` shows for yours:
 
 ```json
@@ -585,12 +522,24 @@ An agent turn carries only the message, so the contract and the tool list have t
 there or the model has neither a format to follow nor anything to call.
 `M365_AGENT_SEND_SYSTEM=1` sends them inline meanwhile.
 
-### Caveats
+### Caveats for agentic use
 
-Same as opencode — emulated tool calls, no incremental streaming when `tools` are
-declared, the 600-message conversation budget, and no image input. If a very long
-turn ever times out, the knobs are `httpIdleTimeoutMs` (default `300000`) and
-`retry.provider.timeoutMs` in `~/.pi/agent/settings.json`.
+* **Tool calls are emulated**, not native. The model is taught a fenced-block
+  contract; it usually follows it, sometimes it doesn't. Expect the occasional turn
+  where it answers in prose instead of calling the tool — that is what
+  [priming](#priming-teaching-a-conversation-before-using-it) exists to catch.
+* **No incremental streaming when tools are declared** — which, for an agentic
+  client, is always. The proxy must see the whole reply before it can tell a tool
+  call from prose, so the answer arrives in one piece. It opens the stream
+  immediately so the connection is not mistaken for a stall, but a reasoning model
+  can still take a minute.
+* **The 600-message conversation budget goes fast.** Every step — each tool result,
+  each follow-up, each priming turn — is one message. Long sessions hit the rotation.
+* **No file or image input.** Non-text content parts are dropped, so dragging an
+  image into the chat sends only the text around it.
+
+If a very long turn ever times out, the knobs are `httpIdleTimeoutMs` (default
+`300000`) and `retry.provider.timeoutMs` in `~/.pi/agent/settings.json`.
 
 ## Corporate TLS interception
 

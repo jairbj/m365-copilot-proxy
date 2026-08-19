@@ -198,7 +198,7 @@ async def test_the_tools_stream_opens_before_the_answer_is_collected(
     client, fake_bizchat, monkeypatch
 ):
     # The tools path must read the whole answer before it can spot a tool call, but
-    # an agentic client aborts a stream that stays silent (opencode's chunkTimeout),
+    # an agentic client aborts a stream that stays silent past its chunk timeout,
     # so the opening chunk has to go out first.
     reply = '```tool_call\n{"tool": "run_shell", "arguments": {"command": "ls"}}\n```'
     fake = await fake_bizchat([snapshot_frame(reply), COMPLETION])

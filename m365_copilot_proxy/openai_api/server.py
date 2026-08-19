@@ -430,8 +430,8 @@ async def buffered_stream(
 
     A tool call is only recognisable once its fenced block is complete, and half a
     block must never reach the client. But the opening chunk is sent BEFORE the turn
-    is collected: agentic clients abort a stream that goes quiet for too long
-    (opencode's `chunkTimeout`), and a reasoning model easily takes a minute.
+    is collected: agentic clients abort a stream that goes quiet for too long, and a
+    reasoning model easily takes a minute.
     """
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     yield _chunk(body.model, completion_id, Delta(role="assistant", content=""))

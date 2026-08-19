@@ -19,6 +19,9 @@ from m365_copilot_proxy.openai_api.tools import TOOL_CONTRACT
 if TYPE_CHECKING:
     from m365_copilot_proxy.agent_instructions import Document
 
+#: Where pi keeps its custom providers.
+PI_MODELS_PATH = Path.home() / ".pi" / "agent" / "models.json"
+
 #: What `priming --init` writes: the message that was found to work by hand, with the
 #: tool list as a placeholder so it stays current instead of going stale in a file.
 STARTER_PRIMING = {
@@ -401,6 +404,61 @@ def priming(
     for index, step in enumerate(rendered, start=1):
         typer.secho(f"\n--- step {index}/{len(rendered)} ({step.describe()}) ---", err=True)
         typer.echo(step.text)
+
+
+@cli.command("pi-config")
+def pi_config(
+    out: str = typer.Option("", "--out", help="Where to write. Default: ~/.pi/agent/models.json."),
+    show: bool = typer.Option(False, "--print", help="Print the result instead of writing it."),
+) -> None:
+    """Write pi's provider config from the models `capture` found.
+
+    Lists this tenant's tones — each in both Work IQ surfaces — plus any declarative
+    agent, so `/model` offers what you actually have instead of a snapshot of someone
+    else's tenant. Only the `m365` provider is touched; anything else in the file is
+    left as it was.
+    """
+    from m365_copilot_proxy import pi_config as generator
+
+    _setup_logging("WARNING")
+    try:
+        block = generator.provider()
+    except generator.NothingCaptured as exc:
+        typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(1) from exc
+
+    path = Path(out) if out else PI_MODELS_PATH
+    existing: object = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            # A hand-edited config is not something to clobber over a typo.
+            typer.secho(
+                f"{path} exists but could not be read as JSON ({exc}). "
+                "Fix or move it; nothing was written.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(1) from exc
+
+    document = generator.merge_into(existing, block)
+    rendered = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+
+    if show:
+        typer.echo(rendered)
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(rendered, encoding="utf-8")
+
+    typer.echo(f"Wrote {path} — {len(block['models'])} models:")
+    for model in block["models"]:
+        typer.echo(f"  {model['id']:<28} {model['name']}")
+    others = [name for name in document["providers"] if name != generator.PROVIDER]
+    if others:
+        typer.echo(f"Left your other provider(s) alone: {', '.join(sorted(others))}")
+    typer.echo("Start the proxy, then `pi --list-models` shows them and `/model` picks one.")
 
 
 @cli.command()
