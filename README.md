@@ -486,6 +486,31 @@ What the fields mean:
 The models are deliberately **not** marked `reasoning: true`: nothing thinking-shaped
 ever comes back, so pi would show a thinking UI that stays empty.
 
+### Adding a declarative agent
+
+Agent ids are tenant-specific, so they are not in the shipped file — add the one
+`GET /v1/models` shows for yours:
+
+```json
+{
+  "id": "agent:agent-1",
+  "name": "M365 Agent",
+  "contextWindow": 128000,
+  "maxTokens": 16384,
+  "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+}
+```
+
+No `-work` twin for it: an agent has no Work IQ toggle. Rename the slug in
+`profile.json` if `agent-1` is not a name you want in a picker — a later capture
+matches the agent by its id, so the rename survives.
+
+One thing to do before using an agent from an agentic client: paste the tool contract
+into the agent's instructions (`m365-copilot-proxy prompt --contract`, ~1k of the
+8000). An agent turn does not carry the contract inline — only the per-request tool
+list — so without it there tool calling has no format to follow. `M365_AGENT_SEND_SYSTEM=1`
+puts it back inline meanwhile.
+
 ### Caveats
 
 Same as opencode — emulated tool calls, no incremental streaming when `tools` are
