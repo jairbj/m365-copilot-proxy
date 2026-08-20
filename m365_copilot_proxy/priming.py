@@ -21,6 +21,7 @@ into the agent's instructions.
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import re
@@ -45,12 +46,28 @@ CONTINUE = "continue"
 #: How the answer is compared, in the log and in the error.
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
 
+#: Everything a step may say. Anything else is a typo, and a typo that is skipped in
+#: silence is how a two-step script quietly becomes a one-step script.
+STEP_KEYS = ("text", "expect", "expect_regex", "label")
+
+#: The same, for the top level: `atempts` must not quietly mean the default.
+SCRIPT_KEYS = ("models", "attempts", "on_failure")
+
 
 class PrimingError(BizChatError):
     """The opening exchange never produced the expected answer.
 
     A `BizChatError` on purpose: the server already turns those into a 502 with the
     message intact, and the streaming paths already catch them.
+    """
+
+
+class PrimingConfigError(PrimingError):
+    """The script itself cannot be read, so no conversation can be primed from it.
+
+    Refusing the turn is the point. Running the steps that happen to parse would leave
+    a conversation primed for some of what the script says and not the rest, with a
+    checked reply still passing — a failure indistinguishable from success.
     """
 
 
@@ -91,23 +108,56 @@ class Step:
             return f"expect {self.expect!r}"
         return "unchecked step"
 
-    @classmethod
-    def from_json(cls, data: Any) -> Step | None:
-        if isinstance(data, str):
-            return cls(text=data)
-        if not isinstance(data, dict):
-            return None
-        text = data.get("text")
-        if not isinstance(text, str) or not text.strip():
-            return None
-        return cls(
+
+def unknown_key_problem(keys: Sequence[str], valid: Sequence[str]) -> str:
+    """Name the misspelt keys, and guess what they were meant to be.
+
+    The guess is the whole value of this message: `texto` for `text` is a one-second
+    fix once someone says it out loud, and a lost afternoon otherwise.
+    """
+    parts = []
+    for key in keys:
+        close = difflib.get_close_matches(key, valid, n=1)
+        hint = f" (did you mean `{close[0]}`?)" if close else ""
+        parts.append(f"unknown key `{key}`{hint}")
+    return f"{'; '.join(parts)} — valid keys are {', '.join(f'`{k}`' for k in valid)}"
+
+
+def parse_step(data: Any) -> tuple[Step | None, str]:
+    """One step, or the reason it cannot be read.
+
+    Never returns a half-understood step: a dict with an unknown key is refused even
+    when it also has a usable `text`, because `{"text": ..., "expects": "ok"}` would
+    otherwise run as a step nobody checks.
+    """
+    if isinstance(data, str):
+        return (Step(text=data), "") if data.strip() else (None, "is an empty string")
+    if not isinstance(data, dict):
+        return None, f"is a {type(data).__name__}, not an object"
+
+    unknown = [key for key in data if key not in STEP_KEYS]
+    if unknown:
+        return None, unknown_key_problem(unknown, STEP_KEYS)
+
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip():
+        present = ", ".join(f"`{k}`" for k in data) or "none"
+        return None, f"has no usable `text` (keys present: {present})"
+
+    for name in ("expect", "expect_regex", "label"):
+        value = data.get(name)
+        if value is not None and not isinstance(value, str):
+            return None, f"`{name}` must be a string, not a {type(value).__name__}"
+
+    return (
+        Step(
             text=text,
-            expect=data.get("expect") if isinstance(data.get("expect"), str) else "",
-            expect_regex=(
-                data.get("expect_regex") if isinstance(data.get("expect_regex"), str) else ""
-            ),
-            label=data.get("label") if isinstance(data.get("label"), str) else "",
-        )
+            expect=data.get("expect") or "",
+            expect_regex=data.get("expect_regex") or "",
+            label=data.get("label") or "",
+        ),
+        "",
+    )
 
 
 @dataclass
@@ -117,6 +167,17 @@ class Script:
     models: dict[str, list[Step]] = field(default_factory=dict)
     attempts: int = 3
     on_failure: str = FAIL
+    #: What could not be read, by model id — `""` for problems with the file itself.
+    #: A script with problems is refused rather than partly run.
+    problems: dict[str, list[str]] = field(default_factory=dict)
+
+    def entry_key(self, model: str | None) -> str | None:
+        """Which entry of the file serves this model: its own, `*`, or neither."""
+        if (model or "") in self.models:
+            return model or ""
+        if ANY_MODEL in self.models:
+            return ANY_MODEL
+        return None
 
     def steps_for(self, model: str | None) -> list[Step]:
         """The steps for a model id, falling back to `*`, or none at all.
@@ -124,10 +185,25 @@ class Script:
         A model in neither place is not primed. That is the whole scoping rule: the
         file says who it applies to, so there is no second setting to disagree with.
         """
-        exact = self.models.get(model or "")
-        if exact is not None:
-            return exact
-        return self.models.get(ANY_MODEL, [])
+        key = self.entry_key(model)
+        return list(self.models[key]) if key is not None else []
+
+    def problems_for(self, model: str | None) -> list[str]:
+        """Everything wrong with the part of the file that serves this model.
+
+        Scoped, so a broken entry for one model does not stop another from running.
+        Problems with the file itself apply to everyone: when it cannot be parsed at
+        all, there is no telling which models it was meant to cover.
+        """
+        found = [f"{FILENAME}: {problem}" for problem in self.problems.get("", [])]
+        key = self.entry_key(model)
+        if key is not None:
+            found += [f"{key}: {problem}" for problem in self.problems.get(key, [])]
+        return found
+
+    @property
+    def is_usable(self) -> bool:
+        return not self.problems
 
     @property
     def fails_closed(self) -> bool:
@@ -139,13 +215,35 @@ class Script:
             raise ValueError("priming config must be a JSON object")
 
         models: dict[str, list[Step]] = {}
+        problems: dict[str, list[str]] = {}
+
+        def note(where: str, problem: str) -> None:
+            problems.setdefault(where, []).append(problem)
+
+        unknown = [key for key in data if key not in SCRIPT_KEYS]
+        if unknown:
+            note("", unknown_key_problem(unknown, SCRIPT_KEYS))
+
         raw_models = data.get("models")
-        if isinstance(raw_models, dict):
+        if raw_models is not None and not isinstance(raw_models, dict):
+            note("", "`models` must be an object mapping model ids to lists of steps")
+        elif isinstance(raw_models, dict):
             for name, raw_steps in raw_models.items():
-                if not isinstance(name, str) or not isinstance(raw_steps, list):
+                if not isinstance(name, str):
+                    note("", f"model id {name!r} is not a string")
                     continue
-                steps = [step for raw in raw_steps if (step := Step.from_json(raw)) is not None]
-                models[name] = steps
+                # Recorded even when empty, so a broken entry still resolves here
+                # rather than silently falling through to the `*` one.
+                models[name] = []
+                if not isinstance(raw_steps, list):
+                    note(name, "must be a list of steps")
+                    continue
+                for index, raw in enumerate(raw_steps, start=1):
+                    step, problem = parse_step(raw)
+                    if step is None:
+                        note(name, f"step {index} {problem}")
+                    else:
+                        models[name].append(step)
 
         attempts = data.get("attempts")
         on_failure = data.get("on_failure")
@@ -153,6 +251,7 @@ class Script:
             models=models,
             attempts=attempts if isinstance(attempts, int) and attempts > 0 else 3,
             on_failure=on_failure if on_failure in (FAIL, CONTINUE) else FAIL,
+            problems=problems,
         )
 
 
@@ -165,12 +264,13 @@ _cache_key: tuple[Path, float] | None = None
 
 
 def load() -> Script:
-    """Read the script, or an empty one when absent or unreadable.
+    """Read the script, or an empty one when there is no file.
 
-    Absent is the normal state and means "prime nothing". A broken file must not take
-    the proxy down with it either — it is logged and ignored, the same way a broken
-    tenant profile is. Re-reads when the file changes, so an edit takes effect on the
-    next conversation without a restart.
+    Absent is the normal state and means "prime nothing". A file that exists but
+    cannot be read is different: it was written to be used, so the failure is carried
+    as a problem rather than swallowed into an empty script that primes nothing and
+    says nothing. Re-reads when the file changes, so an edit takes effect on the next
+    conversation without a restart.
     """
     global _cache, _cache_key
     path = config_path()
@@ -186,18 +286,33 @@ def load() -> Script:
     try:
         script = Script.from_json(json.loads(path.read_text(encoding="utf-8")))
     except Exception as exc:
-        log.warning("Ignoring unreadable priming config at %s: %s", path, exc)
-        script = Script()
+        log.warning("Unreadable priming config at %s: %s", path, exc)
+        script = Script(problems={"": [f"cannot be read ({exc})"]})
     else:
         log.info(
-            "Loaded priming script: %d model(s), %d attempts, on_failure=%s",
+            "Loaded priming script: %d model(s), %d attempts, on_failure=%s%s",
             len(script.models),
             script.attempts,
             script.on_failure,
+            f", {sum(len(p) for p in script.problems.values())} problem(s)"
+            if script.problems
+            else "",
         )
+        for where, found in script.problems.items():
+            for problem in found:
+                log.warning("Priming config: %s%s", f"{where}: " if where else "", problem)
 
     _cache, _cache_key = script, key
     return _cache
+
+
+def describe_problems(problems: Sequence[str]) -> str:
+    """The message a user acts on: what is wrong, where the file is, how to opt out."""
+    listed = "\n".join(f"  - {problem}" for problem in problems)
+    return (
+        f"The priming script cannot be used as written:\n{listed}\n"
+        f"Fix {config_path()}, or set M365_PRIMING=0 to run without priming."
+    )
 
 
 def reset_cache() -> None:

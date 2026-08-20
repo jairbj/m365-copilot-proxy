@@ -357,6 +357,18 @@ def priming(
         return
 
     script = priming_config.load()
+
+    problems = [
+        f"{where}: {problem}" if where else problem
+        for where, found in script.problems.items()
+        for problem in found
+    ]
+    if problems:
+        # No rendering when the file is broken: showing the steps that survived is
+        # exactly the illusion that hides a missing one.
+        typer.secho(priming_config.describe_problems(problems), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+
     if not script.models:
         typer.secho(
             f"No priming script at {path}. Run `m365-copilot-proxy priming --init`.",

@@ -319,7 +319,16 @@ def priming_steps(body: ChatCompletionRequest, turn: PooledTurn) -> list[priming
     """
     if not get_settings().priming:
         return []
-    steps = priming.load().steps_for(body.model)
+
+    script = priming.load()
+    problems = script.problems_for(body.model)
+    if problems:
+        # Running the steps that happen to parse would leave the conversation primed
+        # for some of the script and not the rest, with the checked replies still
+        # passing. Better to stop than to be half-taught and look fine.
+        raise priming.PrimingConfigError(priming.describe_problems(problems))
+
+    steps = script.steps_for(body.model)
     if not steps:
         return []
     return priming.rendered_steps(

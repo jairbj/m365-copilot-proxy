@@ -758,3 +758,72 @@ async def test_priming_can_be_turned_off_without_editing_the_script(
     )
 
     assert sent_texts(fake) == ["hello"]
+
+
+async def test_a_script_that_cannot_be_read_stops_the_turn(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    # Running the steps that parsed would prime the conversation for half the script
+    # while the checked replies still pass — a failure that looks like success.
+    priming_script(
+        {
+            "models": {
+                captured_agent: [
+                    {"text": "use your tools", "expect": "agente-ok"},
+                    {"label": "system prompt", "texto": "be terse", "expect": "agente-ok2"},
+                ]
+            }
+        }
+    )
+    fake = await fake_bizchat([snapshot_frame("agente-ok"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 502
+    message = response.json()["error"]["message"]
+    assert "step 2" in message and "`texto`" in message
+    # It says how to get moving again without editing the file.
+    assert "M365_PRIMING=0" in message
+    # Nothing was sent: not the priming step that did parse, not the user's message.
+    assert chat_invocations(fake) == []
+
+
+async def test_a_broken_script_for_another_model_does_not_block_this_one(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script({"models": {"some-other-model": [{"texto": "broken"}]}})
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert sent_texts(fake) == ["hello"]
+
+
+async def test_a_broken_script_is_ignored_when_priming_is_off(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    # M365_PRIMING=0 is what the error message offers, so it has to actually work.
+    priming_script({"models": {captured_agent: [{"texto": "broken"}]}})
+    monkeypatch.setenv("M365_PRIMING", "0")
+    from m365_copilot_proxy.config import get_settings
+
+    get_settings.cache_clear()
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert sent_texts(fake) == ["hello"]

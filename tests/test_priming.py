@@ -57,12 +57,18 @@ class TestLoading:
         write({"models": {"agent:bot": [], "*": [{"text": "be brief"}]}})
         assert priming.load().steps_for("agent:bot") == []
 
-    def test_a_broken_file_is_ignored_not_fatal(self):
+    def test_a_broken_file_is_a_problem_not_an_empty_script(self):
+        # Silently priming nothing is the degradation this whole round exists to
+        # stop: the file was written to be used.
         priming.config_path().parent.mkdir(parents=True, exist_ok=True)
         priming.config_path().write_text("{not json", encoding="utf-8")
         priming.reset_cache()
 
-        assert priming.load().models == {}
+        script = priming.load()
+        assert script.models == {}
+        assert not script.is_usable
+        # Nothing says which models it covered, so it applies to all of them.
+        assert script.problems_for("anything") != []
 
     def test_nonsense_values_fall_back_to_the_safe_ones(self):
         write({"attempts": -4, "on_failure": "explode", "models": {"*": ["just text"]}})
@@ -129,3 +135,89 @@ class TestPlaceholders:
 
         assert rendered[0].expect == "ok"
         assert rendered[0].describe() == "tools"
+
+
+class TestProblems:
+    """A step that cannot be read is refused, never quietly skipped."""
+
+    #: The file that prompted this: `texto` where the schema says `text`. It loaded
+    #: one step of two and said nothing.
+    REPORTED = {
+        "attempts": 1,
+        "on_failure": "fail",
+        "models": {
+            "agent:agent-1": [
+                {"label": "use the tools", "text": "use your tools", "expect": "agente-ok"},
+                {"label": "system prompt", "texto": "the personality", "expect": "agente-ok2"},
+            ]
+        },
+    }
+
+    def test_the_reported_typo_is_named_and_guessed(self):
+        write(self.REPORTED)
+        problems = priming.load().problems_for("agent:agent-1")
+
+        assert len(problems) == 1
+        assert "step 2" in problems[0]
+        assert "`texto`" in problems[0]
+        assert "did you mean `text`?" in problems[0]
+
+    def test_a_typo_in_expect_is_a_problem_too(self):
+        # Otherwise the step runs unchecked, which looks like passing.
+        write({"models": {"*": [{"text": "hi", "expects": "ok"}]}})
+
+        assert "did you mean `expect`?" in priming.load().problems_for("x")[0]
+
+    def test_a_step_with_no_text_lists_the_keys_it_does_have(self):
+        write({"models": {"*": [{"label": "x", "expect": "ok"}]}})
+
+        problem = priming.load().problems_for("x")[0]
+        assert "no usable `text`" in problem
+        assert "`label`" in problem
+
+    def test_a_valid_script_has_no_problems(self):
+        write(SCRIPT)
+        script = priming.load()
+
+        assert script.is_usable
+        assert script.problems_for("agent:bot") == []
+        assert len(script.steps_for("agent:bot")) == 1
+
+    def test_a_broken_entry_does_not_block_another_model(self):
+        write(
+            {
+                "models": {
+                    "broken": [{"texto": "x"}],
+                    "agent:fine": [{"text": "hi", "expect": "ok"}],
+                }
+            }
+        )
+        script = priming.load()
+
+        assert script.problems_for("agent:fine") == []
+        assert script.problems_for("broken") != []
+
+    def test_a_broken_entry_does_not_fall_through_to_the_star_one(self):
+        # Its own entry is what serves it, however little of it survived parsing.
+        write({"models": {"broken": [{"texto": "x"}], "*": [{"text": "fallback"}]}})
+        script = priming.load()
+
+        assert script.problems_for("broken") != []
+        assert script.steps_for("broken") == []
+
+    def test_an_unknown_top_level_key_is_caught(self):
+        write({"atempts": 5, "models": {"*": [{"text": "hi"}]}})
+
+        assert "did you mean `attempts`?" in priming.load().problems_for("x")[0]
+
+    def test_a_step_that_is_not_an_object_says_what_it_is(self):
+        write({"models": {"*": [42]}})
+
+        assert "not an object" in priming.load().problems_for("x")[0]
+
+    def test_the_message_names_the_file_and_the_way_out(self):
+        write(self.REPORTED)
+        report = priming.describe_problems(priming.load().problems_for("agent:agent-1"))
+
+        assert str(priming.config_path()) in report
+        assert "M365_PRIMING=0" in report

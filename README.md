@@ -375,6 +375,22 @@ and one round trip, and a retry spends them again. Two steps at three attempts i
 messages before the user's first word. The proxy opens the response immediately and
 primes in the gap, so a client waiting on the first chunk does not see a stall.
 
+**A step it cannot read stops the turn.** A misspelt key — `texto` for `text`,
+`expects` for `expect` — is refused rather than skipped, because a half-run script
+leaves the conversation taught some of what you wrote and not the rest, with the
+checked replies still passing. The error names the step and guesses the key:
+
+```
+The priming script cannot be used as written:
+  - agent:agent-1: step 2 unknown key `texto` (did you mean `text`?) — valid keys are …
+Fix ~/.config/m365-copilot-proxy/priming.json, or set M365_PRIMING=0 to run without priming.
+```
+
+`m365-copilot-proxy priming` reports the same thing and exits non-zero, so it doubles
+as the check to run after editing the file. A broken entry for one model does not stop
+another; a file that cannot be parsed at all stops every primed turn, since nothing
+says which models it was meant to cover.
+
 `M365_PRIMING=0` disables the whole thing without editing the file — useful for
 telling "the model ignores its tools" apart from "my script is wrong".
 
