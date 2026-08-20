@@ -644,6 +644,7 @@ Everything is settable through `M365_*` environment variables or a `.env` file:
 | `M365_RECORD_SYSTEM_PROMPTS` | `true` | Keep each conversation's system prompt for `prompt` |
 | `M365_AGENT_SEND_SYSTEM` | `false` | Send the system block and tool contract on an agent turn |
 | `M365_PRIMING` | `true` | Run `priming.json` on every new conversation |
+| `M365_EMPTY_RETRIES` | `2` | Resend a turn that came back with no content |
 | `M365_DUMP_FRAMES` | `false` | Write every SignalR frame to `<config_dir>/frames/` |
 | `M365_LOG_LEVEL` | `INFO` | Logging level |
 
@@ -661,6 +662,12 @@ Everything is settable through `M365_*` environment variables or a `.env` file:
   and ignored, because BizChat exposes nothing to map them onto.
 * **Safety refusals** surface as a `Disengaged` turn; the proxy says so explicitly
   instead of returning a blank answer.
+* **Turns sometimes come back empty**, with no content and no explanation. The same
+  message sent again usually works, so the proxy resends it — twice by default
+  (`M365_EMPTY_RETRIES`), in the same conversation, and only when nothing at all was
+  produced, since a partly streamed answer could not be retried safely. A `Disengaged`
+  turn is never resent. Each attempt is a real turn and spends one of the 600
+  messages; past the last one, the "returned no content" note comes back as before.
 * **The wire format is undocumented and moves.** Model tones, feature variants and
   the licence surface all change without notice — `capture` exists precisely because
   the built-in defaults will drift out of date.

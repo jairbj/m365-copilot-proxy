@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     #: because the agent carries both and honours them; turn it on when an agent has
     #: drifted out of sync with the client that is calling.
     agent_send_system: bool = False
+    #: How many times to resend a turn that came back with no content at all.
+    #: Copilot does that intermittently, and the same message sent again works.
+    #: Each retry is a real turn: it spends one of the conversation's 600 messages.
+    #: 0 answers with the "returned no content" note instead, as it used to.
+    empty_retries: int = 2
     #: Run the opening exchange in `<config_dir>/priming.json` on every new
     #: conversation. On, because a script that exists is a script someone wanted;
     #: turn it off to tell "the model ignores its tools" apart from "the script is
