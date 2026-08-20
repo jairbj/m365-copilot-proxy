@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -197,7 +198,7 @@ async def test_the_tools_stream_opens_before_the_answer_is_collected(
     client, fake_bizchat, monkeypatch
 ):
     # The tools path must read the whole answer before it can spot a tool call, but
-    # an agentic client aborts a stream that stays silent (opencode's chunkTimeout),
+    # an agentic client aborts a stream that stays silent past its chunk timeout,
     # so the opening chunk has to go out first.
     reply = '```tool_call\n{"tool": "run_shell", "arguments": {"command": "ls"}}\n```'
     fake = await fake_bizchat([snapshot_frame(reply), COMPLETION])
@@ -262,8 +263,6 @@ async def test_the_work_suffix_reaches_the_wire_and_keeps_the_tone(
         "/v1/chat/completions",
         json={"model": "gpt-5.5-work", "messages": [{"role": "user", "content": "hi"}]},
     )
-    from urllib.parse import parse_qs, urlparse
-
     assert parse_qs(urlparse(fake.urls[0]).query)["agent"] == ["work"]
     # The suffix must not leak into the tone lookup.
     from m365_copilot_proxy.bizchat import protocol
@@ -295,3 +294,536 @@ async def test_models_lists_the_work_variants(client: httpx.AsyncClient):
 async def test_health_reports_the_conversation_count(client: httpx.AsyncClient):
     response = await client.get("/health")
     assert response.json()["status"] == "ok"
+
+
+# --- Declarative agents ------------------------------------------------------
+
+
+#: The agent id, exactly as a real work tenant sends it.
+GPT_ID = "T_ee433d1f-0020-fb71-0e6e-64942eccb480.gpt.1ce6ba88-1509-4424-b7f2-91865ca8ce98@MOS3"
+
+#: The session key that capture happened to see. It must never reach the wire.
+CAPTURED_SESSION_KEY = "0fa68510-6474-4ce6-a265-852d93b216ab"
+
+#: One agent, shortened from a real capture and otherwise unedited — the surface
+#: field reads `Agent` (neither `work` nor `web`), the id appears in the query as
+#: well as in the invocation, a tone IS sent, and no `plugins` field is.
+REAL_AGENT = {
+    "surface": {
+        "query": {
+            "XRoutingParameterSessionKey": CAPTURED_SESSION_KEY,
+            "gptId": GPT_ID,
+            "source": '"officeweb"',
+            "product": "Office",
+            "agentHost": "Bizchat.FullScreen",
+            "licenseType": "Premium",
+            "isEdu": "false",
+            "agent": "Agent",
+            "scenario": "officeweb",
+            "variants": "feature.agent",
+        },
+        "option_sets": ["at_mention_plugins_enable", "enterprise_flux_work"],
+        "allowed_message_types": ["Chat", "EndOfRequest"],
+        "plugins": None,
+    },
+    "thread_level_gpt_id": {"id": GPT_ID, "source": "MOS3"},
+    "extra_extension_parameters": {},
+    "tone": "Chat",
+    "source": "officeweb",
+    # The whole invocation, kept because replaying a chosen subset of it reached the
+    # agent's thread and was still answered by plain Copilot.
+    "raw_argument": {
+        "source": "officeweb",
+        "streamingMode": "Delta",
+        "threadLevelGptId": {"id": GPT_ID, "source": "MOS3"},
+        "clientInfo": {"clientPlatform": "mcmcopilot-web", "clientAppName": "Office"},
+        "message": {"author": "user", "experienceType": "Agent"},
+    },
+}
+
+
+@pytest.fixture
+def captured_agent(tmp_path, monkeypatch):
+    """A profile holding one captured agent, isolated from the real config dir."""
+    import json
+
+    from m365_copilot_proxy.bizchat import profile as tenant_profile
+    from m365_copilot_proxy.config import get_settings
+
+    monkeypatch.setenv("M365_CONFIG_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    tenant_profile.reset_cache()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    tenant_profile.profile_path().write_text(
+        json.dumps({"agents": {"sales-bot": REAL_AGENT}}), encoding="utf-8"
+    )
+    tenant_profile.reset_cache()
+    yield "agent:sales-bot"
+    get_settings.cache_clear()
+    tenant_profile.reset_cache()
+
+
+async def test_a_captured_agent_is_offered_as_a_model(client, captured_agent):
+    response = await client.get("/v1/models")
+    ids = {model["id"] for model in response.json()["data"]}
+
+    assert captured_agent in ids
+    # No Work IQ twin: the agent UI has neither that toggle nor a model picker.
+    assert f"{captured_agent}-work" not in ids
+
+
+async def test_an_agent_turn_carries_its_id_and_drops_the_system_block(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hello"},
+            ],
+        },
+    )
+
+    arguments = fake.chat_arguments
+    assert arguments["threadLevelGptId"] == {"id": GPT_ID, "source": "MOS3"}
+    assert arguments["optionsSets"] == ["at_mention_plugins_enable", "enterprise_flux_work"]
+    # The agent carries the instructions itself, and honours them.
+    assert arguments["message"]["text"] == "hello"
+    # Replayed as captured: the agent UI sends a tone, it just does not offer a choice.
+    assert arguments["tone"] == "Chat"
+    # It sends no `plugins` field at all, so neither do we — handing an agent the
+    # Bing plugin its own client never asks for is a change to how it answers.
+    assert "plugins" not in arguments
+
+    query = parse_qs(urlparse(fake.urls[0]).query)
+    # The id identifies the thread in two places; only replaying both enters the agent.
+    assert query["gptId"] == [GPT_ID]
+    assert query["agent"] == ["Agent"]
+
+
+async def test_the_agent_turn_is_shaped_like_the_captured_one(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    # Everything the client sends and this code does not build for itself has to
+    # survive, since that is where the agent's instructions are asked for.
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    arguments = fake.chat_arguments
+    assert arguments["streamingMode"] == "Delta"
+    assert arguments["message"]["experienceType"] == "Agent"
+    # …while the turn keeps its own text and ids.
+    assert arguments["message"]["text"] == "hello"
+    assert arguments["message"]["requestId"] == arguments["traceId"]
+    assert arguments["clientInfo"]["clientSessionId"]
+
+
+async def test_the_captured_session_key_is_never_replayed(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    # `XRoutingParameterSessionKey` names a session, and the one capture saw ended
+    # when the browser window closed. Each conversation mints its own.
+    import uuid
+
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    for opening in ("first thread", "second thread"):
+        await client.post(
+            "/v1/chat/completions",
+            json={"model": captured_agent, "messages": [{"role": "user", "content": opening}]},
+        )
+
+    keys = [parse_qs(urlparse(url).query)["XRoutingParameterSessionKey"][0] for url in fake.urls]
+    assert CAPTURED_SESSION_KEY not in keys
+    assert len(set(keys)) == 2
+    for key in keys:
+        uuid.UUID(key)  # raises if it is not one
+
+
+async def test_an_agent_turn_carries_the_message_and_nothing_else(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    # Contract, tool list and system prompt all live in the agent's instructions.
+    # What is not pasted there is not sent at all.
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hello"},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "run_shell", "description": "run it"}}
+            ],
+        },
+    )
+
+    assert fake.chat_arguments["message"]["text"] == "hello"
+
+
+async def test_an_agent_turn_still_records_the_tool_list_to_paste(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    # The list has to reach the user somehow, or there is nothing to put in the agent.
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "run_shell", "description": "run it"}}
+            ],
+        },
+    )
+
+    payload = (await client.get("/v1/system-prompt")).json()
+    assert "run_shell" in payload["text"]
+    assert [s["title"] for s in payload["sections"]] == ["Tool calling", "Available tools"]
+
+
+async def test_an_agent_that_has_drifted_can_be_sent_the_instructions_anyway(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    from m365_copilot_proxy.config import get_settings
+
+    monkeypatch.setenv("M365_AGENT_SEND_SYSTEM", "1")
+    get_settings.cache_clear()
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hello"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "run_shell", "description": "run it"},
+                }
+            ],
+        },
+    )
+
+    sent = fake.chat_arguments["message"]["text"]
+    assert "be terse" in sent
+    # The contract comes back with it: the flag means "treat this like plain chat".
+    assert "```tool_call" in sent
+
+
+async def test_an_uncaptured_agent_is_an_error_not_a_plain_chat(client, captured_agent):
+    # Serving plain Copilot under an agent's name would be invisible to the caller.
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "agent:nope", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 400
+    assert "capture" in response.json()["error"]["message"]
+
+
+# --- The system prompt, for pasting into an agent ----------------------------
+
+
+async def test_the_system_prompt_is_recorded_and_served_with_its_size(
+    client, fake_bizchat, monkeypatch, captured_agent
+):
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "claude-sonnet",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hello"},
+            ],
+        },
+    )
+
+    payload = (await client.get("/v1/system-prompt")).json()
+    assert payload["text"].endswith("be terse")
+    assert payload["limit"] == 8000
+    assert payload["chars"] == len(payload["text"])
+    assert payload["over_by"] == 0
+    assert payload["source"]["model"] == "claude-sonnet"
+
+    listed = (await client.get("/v1/system-prompts")).json()["data"]
+    assert [entry["model"] for entry in listed] == ["claude-sonnet"]
+
+    as_text = await client.get("/v1/system-prompt", params={"format": "text"})
+    assert as_text.text == payload["text"]
+
+
+async def test_the_system_prompt_endpoint_says_when_there_is_nothing_yet(
+    client, captured_agent
+):
+    response = await client.get("/v1/system-prompt")
+
+    assert response.status_code == 404
+    assert "No system prompt recorded" in response.json()["error"]["message"]
+
+
+# --- Priming: a scripted opening exchange ------------------------------------
+
+
+def chat_invocations(fake) -> list[dict]:
+    return [f["arguments"][0] for f in fake.received if f.get("target") == "chat"]
+
+
+def sent_texts(fake) -> list[str]:
+    return [a["message"]["text"] for a in chat_invocations(fake)]
+
+
+def conversation_ids(fake) -> list[str]:
+    return [parse_qs(urlparse(url).query)["ConversationId"][0] for url in fake.urls]
+
+
+@pytest.fixture
+def priming_script(tmp_path, monkeypatch):
+    """Write a priming script into the same isolated config dir the agent uses."""
+    import json as json_module
+
+    from m365_copilot_proxy import priming
+
+    monkeypatch.setenv("M365_CONFIG_DIR", str(tmp_path))
+
+    def write(script: dict) -> None:
+        from m365_copilot_proxy.config import get_settings
+
+        get_settings.cache_clear()
+        priming.config_path().parent.mkdir(parents=True, exist_ok=True)
+        priming.config_path().write_text(json_module.dumps(script), encoding="utf-8")
+        priming.reset_cache()
+
+    yield write
+    priming.reset_cache()
+
+
+async def test_a_primed_conversation_is_taught_before_it_is_used(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script(
+        {
+            "models": {
+                captured_agent: [
+                    {"text": "always use your tools\n\n{{tools_prompt}}", "expect": "agente-ok"}
+                ]
+            }
+        }
+    )
+    fake = await fake_bizchat([snapshot_frame("agente-ok"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "run_shell", "description": "run it"}}
+            ],
+        },
+    )
+
+    texts = sent_texts(fake)
+    assert len(texts) == 2
+    # The teaching comes first, carrying the client's CURRENT tool list…
+    assert texts[0].startswith("always use your tools")
+    assert "run_shell" in texts[0]
+    # …and the user's message follows it, in the same conversation.
+    assert texts[1] == "hello"
+    assert len(set(conversation_ids(fake))) == 1
+
+
+async def test_a_conversation_that_did_not_take_it_in_is_thrown_away(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script(
+        {
+            "attempts": 2,
+            "models": {captured_agent: [{"text": "always use your tools", "expect": "agente-ok"}]},
+        }
+    )
+    fake = await fake_bizchat([snapshot_frame("sure, whatever"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 502
+    message = response.json()["error"]["message"]
+    assert "agente-ok" in message and "sure, whatever" in message
+    # Two conversations tried, and the user's message never sent to either.
+    assert len(set(conversation_ids(fake))) == 2
+    assert "hello" not in sent_texts(fake)
+
+
+async def test_continue_sends_the_turn_even_though_priming_failed(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script(
+        {
+            "attempts": 2,
+            "on_failure": "continue",
+            "models": {captured_agent: [{"text": "always use your tools", "expect": "agente-ok"}]},
+        }
+    )
+    fake = await fake_bizchat([snapshot_frame("sure, whatever"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert sent_texts(fake)[-1] == "hello"
+
+
+async def test_a_model_the_script_does_not_name_is_left_alone(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script({"models": {"some-other-model": [{"text": "teach"}]}})
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert sent_texts(fake) == ["hello"]
+
+
+async def test_a_live_conversation_is_not_taught_twice(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    # The second request continues the same conversation, which has already been told.
+    priming_script({"models": {captured_agent: [{"text": "teach", "expect": "agente-ok"}]}})
+    fake = await fake_bizchat([snapshot_frame("agente-ok"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    first = [{"role": "user", "content": "hello"}]
+    await client.post("/v1/chat/completions", json={"model": captured_agent, "messages": first})
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": captured_agent,
+            "messages": [*first, {"role": "assistant", "content": "agente-ok"},
+                         {"role": "user", "content": "again"}],
+        },
+    )
+
+    assert sent_texts(fake) == ["teach", "hello", "again"]
+
+
+async def test_priming_can_be_turned_off_without_editing_the_script(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script({"models": {captured_agent: [{"text": "teach", "expect": "agente-ok"}]}})
+    monkeypatch.setenv("M365_PRIMING", "0")
+    from m365_copilot_proxy.config import get_settings
+
+    get_settings.cache_clear()
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert sent_texts(fake) == ["hello"]
+
+
+async def test_a_script_that_cannot_be_read_stops_the_turn(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    # Running the steps that parsed would prime the conversation for half the script
+    # while the checked replies still pass — a failure that looks like success.
+    priming_script(
+        {
+            "models": {
+                captured_agent: [
+                    {"text": "use your tools", "expect": "agente-ok"},
+                    {"label": "system prompt", "texto": "be terse", "expect": "agente-ok2"},
+                ]
+            }
+        }
+    )
+    fake = await fake_bizchat([snapshot_frame("agente-ok"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 502
+    message = response.json()["error"]["message"]
+    assert "step 2" in message and "`texto`" in message
+    # It says how to get moving again without editing the file.
+    assert "M365_PRIMING=0" in message
+    # Nothing was sent: not the priming step that did parse, not the user's message.
+    assert chat_invocations(fake) == []
+
+
+async def test_a_broken_script_for_another_model_does_not_block_this_one(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    priming_script({"models": {"some-other-model": [{"texto": "broken"}]}})
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert sent_texts(fake) == ["hello"]
+
+
+async def test_a_broken_script_is_ignored_when_priming_is_off(
+    client, fake_bizchat, monkeypatch, captured_agent, priming_script
+):
+    # M365_PRIMING=0 is what the error message offers, so it has to actually work.
+    priming_script({"models": {captured_agent: [{"texto": "broken"}]}})
+    monkeypatch.setenv("M365_PRIMING", "0")
+    from m365_copilot_proxy.config import get_settings
+
+    get_settings.cache_clear()
+    fake = await fake_bizchat([snapshot_frame("hi"), COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": captured_agent, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert sent_texts(fake) == ["hello"]

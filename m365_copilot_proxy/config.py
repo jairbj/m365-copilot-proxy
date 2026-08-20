@@ -76,6 +76,20 @@ class Settings(BaseSettings):
     #: and company content should not enter a conversation unasked. Turn it on per
     #: request with the `-work` model suffix.
     work_iq: bool = False
+    #: Keep a copy of each conversation's system prompt under
+    #: `<config_dir>/agent-instructions/`, so `m365-copilot-proxy prompt` can show
+    #: what to paste into a declarative agent. Local, single-user, own data.
+    record_system_prompts: bool = True
+    #: Send the `[System instructions]` block and the tool contract even when the
+    #: turn is bound to a declarative agent — i.e. treat it like plain Copilot. Off,
+    #: because the agent carries both and honours them; turn it on when an agent has
+    #: drifted out of sync with the client that is calling.
+    agent_send_system: bool = False
+    #: Run the opening exchange in `<config_dir>/priming.json` on every new
+    #: conversation. On, because a script that exists is a script someone wanted;
+    #: turn it off to tell "the model ignores its tools" apart from "the script is
+    #: wrong" without editing the file.
+    priming: bool = True
     #: Append NDJSON of every SignalR frame to `<config_dir>/frames/<id>.ndjson`.
     dump_frames: bool = False
     log_level: str = "INFO"
@@ -91,6 +105,10 @@ class Settings(BaseSettings):
     @property
     def frames_dir(self) -> Path:
         return self.config_dir / "frames"
+
+    @property
+    def capture_dir(self) -> Path:
+        return self.config_dir / "capture"
 
 
 @lru_cache(maxsize=1)

@@ -128,3 +128,69 @@ def test_extract_throttling():
     assert frames.extract_throttling(payload) == (3, 600)
     assert frames.extract_throttling({"throttling": {}}) is None
     assert frames.extract_throttling({}) is None
+
+
+class TestTheAgentTemplate:
+    """Replaying a whole captured invocation, not just the fields we knew about."""
+
+    #: A captured agent turn, per-turn fields already stripped, carrying one field
+    #: this code has never heard of — which is the case that matters.
+    TEMPLATE = {
+        "source": "officeweb",
+        "streamingMode": "Delta",
+        "sliceIds": ["slice-a"],
+        "gptDefinition": {"instructions": "be terse"},
+        "clientInfo": {"clientPlatform": "agents-web"},
+        "message": {"author": "user", "experienceType": "Agent", "locale": "pt-br"},
+    }
+
+    def build(self, **overrides):
+        arguments = frames.build_chat_invocation(
+            text="hello",
+            request_id="req-1",
+            session_id="sess-1",
+            is_start_of_session=True,
+            tone="Chat",
+            options_sets=["agent_set"],
+            template=self.TEMPLATE,
+            **overrides,
+        )
+        return arguments["arguments"][0]
+
+    def test_a_field_we_never_heard_of_survives(self):
+        assert self.build()["gptDefinition"] == {"instructions": "be terse"}
+
+    def test_the_template_wins_over_our_defaults(self):
+        argument = self.build()
+        assert argument["streamingMode"] == "Delta"
+        assert argument["sliceIds"] == ["slice-a"]
+        assert argument["message"]["experienceType"] == "Agent"
+        assert argument["message"]["locale"] == "pt-br"
+        assert argument["clientInfo"]["clientPlatform"] == "agents-web"
+
+    def test_this_turn_still_owns_its_own_identity(self):
+        argument = self.build()
+        assert argument["message"]["text"] == "hello"
+        assert argument["message"]["requestId"] == "req-1"
+        assert argument["clientCorrelationId"] == "req-1"
+        assert argument["sessionId"] == "sess-1"
+        assert argument["traceId"] == "req-1"
+        assert argument["isStartOfSession"] is True
+        assert argument["clientInfo"]["clientSessionId"] == "sess-1"
+
+    def test_the_computed_fields_stay_computed(self):
+        # optionsSets carries the image-generation layering, which a template
+        # recorded from a plain turn cannot know about.
+        assert self.build()["optionsSets"] == ["agent_set"]
+
+    def test_no_template_changes_nothing(self):
+        plain = frames.build_chat_invocation(
+            text="hello",
+            request_id="req-1",
+            session_id="sess-1",
+            is_start_of_session=True,
+            tone="magic",
+        )["arguments"][0]
+        assert plain["streamingMode"] == "ConciseWithPadding"
+        assert plain["message"]["experienceType"] == "Default"
+        assert "gptDefinition" not in plain

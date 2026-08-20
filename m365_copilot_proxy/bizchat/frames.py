@@ -18,6 +18,7 @@ Protocol shape:
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
@@ -88,59 +89,97 @@ def build_chat_invocation(
     request_id: str,
     session_id: str,
     is_start_of_session: bool,
-    tone: str,
+    tone: str | None,
     options_sets: list[str] | None = None,
     allowed_message_types: list[str] | None = None,
     plugin_list: list[dict[str, Any]] | None = None,
+    thread_level_gpt_id: dict[str, Any] | None = None,
+    extra_extension_parameters: dict[str, Any] | None = None,
+    template: dict[str, Any] | None = None,
+    source: str = "officeweb",
     locale: str = "en-us",
     time_zone: str = "UTC",
 ) -> dict[str, Any]:
-    """The type:4 `chat` invocation carrying the user's turn."""
+    """The type:4 `chat` invocation carrying the user's turn.
+
+    `thread_level_gpt_id` is what puts the turn inside a declarative agent — the
+    custom agents built in the Copilot UI, which honour their own instructions where
+    plain chat ignores the ones we inline. It is opaque: `capture` records the object
+    the real client sends and this replays it unread. Empty means plain Copilot.
+
+    `tone` and `plugin_list` are left out of the invocation entirely when None, which
+    is how a real capture of an agent turn looks: it carries no `plugins` field at all.
+    What to send instead of nothing is `protocol`'s decision, not this function's — the
+    default belongs in one place, next to the surfaces it describes.
+
+    `template` is a whole captured invocation to build on, for an agent. Sending the
+    fields we knew to record reached the agent's thread but was answered by plain
+    Copilot, so the fields we did NOT know about are the ones that matter: the template
+    supplies every one of them, and only what genuinely belongs to this turn — the
+    text, the ids, the session — is written over the top.
+    """
+    argument: dict[str, Any] = {
+        "source": source,
+        "clientCorrelationId": request_id,
+        "sessionId": session_id,
+        "optionsSets": options_sets or [],
+        "streamingMode": "ConciseWithPadding",
+        "spokenTextMode": "None",
+        "options": {},
+        "extraExtensionParameters": dict(extra_extension_parameters or {}),
+        "allowedMessageTypes": allowed_message_types or list(protocol.ALLOWED_MESSAGE_TYPES),
+        "sliceIds": [],
+        "threadLevelGptId": dict(thread_level_gpt_id or {}),
+        "traceId": request_id,
+        "isStartOfSession": is_start_of_session,
+        "clientInfo": {**protocol.CLIENT_INFO, "clientSessionId": session_id},
+        "message": {
+            "author": "user",
+            "inputMethod": "Keyboard",
+            "text": text,
+            "entityAnnotationTypes": list(protocol.ENTITY_ANNOTATION_TYPES),
+            "requestId": request_id,
+            "locationInfo": {"timeZoneOffset": 0, "timeZone": time_zone},
+            "locale": locale,
+            "messageType": "Chat",
+            "experienceType": "Default",
+            "adaptiveCards": [],
+            "clientPreferences": {},
+        },
+        "isSbsSupported": True,
+        "renderReferencesBehindEOS": True,
+        "disconnectBehavior": "continue",
+    }
+    if plugin_list is not None:
+        argument["plugins"] = [dict(p) for p in plugin_list]
+    if tone is not None:
+        argument["tone"] = tone
+
+    if template:
+        # The template describes the client's shape and WINS, because the fields that
+        # matter are the ones nobody here thought to build. It carries no per-turn
+        # fields — `capture` strips them — so this turn's ids, session and text
+        # survive the merge by simply not being in it.
+        merged = {**argument, **deepcopy(template)}
+        for key in ("message", "clientInfo"):
+            base, ours = template.get(key), argument.get(key)
+            if isinstance(base, dict) and isinstance(ours, dict):
+                merged[key] = {**ours, **deepcopy(base)}
+        # Except these: they are computed from the same capture, and `optionsSets`
+        # additionally carries the image-generation layering the template cannot know
+        # about.
+        for key in ("optionsSets", "allowedMessageTypes", "plugins", "tone"):
+            if key in argument:
+                merged[key] = argument[key]
+            else:
+                merged.pop(key, None)
+        argument = merged
+
     return {
         "type": TYPE_CLIENT_INVOCATION,
         "target": "chat",
         "invocationId": "0",
-        "arguments": [
-            {
-                "source": "officeweb",
-                "clientCorrelationId": request_id,
-                "sessionId": session_id,
-                "optionsSets": options_sets or [],
-                "streamingMode": "ConciseWithPadding",
-                "spokenTextMode": "None",
-                "options": {},
-                "extraExtensionParameters": {},
-                "allowedMessageTypes": allowed_message_types
-                or list(protocol.ALLOWED_MESSAGE_TYPES),
-                "sliceIds": [],
-                "threadLevelGptId": {},
-                "traceId": request_id,
-                "isStartOfSession": is_start_of_session,
-                "clientInfo": {**protocol.CLIENT_INFO, "clientSessionId": session_id},
-                "message": {
-                    "author": "user",
-                    "inputMethod": "Keyboard",
-                    "text": text,
-                    "entityAnnotationTypes": list(protocol.ENTITY_ANNOTATION_TYPES),
-                    "requestId": request_id,
-                    "locationInfo": {"timeZoneOffset": 0, "timeZone": time_zone},
-                    "locale": locale,
-                    "messageType": "Chat",
-                    "experienceType": "Default",
-                    "adaptiveCards": [],
-                    "clientPreferences": {},
-                },
-                "plugins": (
-                    [dict(p) for p in plugin_list]
-                    if plugin_list is not None
-                    else [dict(protocol.BING_PLUGIN)]
-                ),
-                "isSbsSupported": True,
-                "tone": tone,
-                "renderReferencesBehindEOS": True,
-                "disconnectBehavior": "continue",
-            }
-        ],
+        "arguments": [argument],
     }
 
 

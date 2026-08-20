@@ -6,12 +6,13 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from functools import partial
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from m365_copilot_proxy import tls
+from m365_copilot_proxy import agent_instructions, priming, tls
 from m365_copilot_proxy.auth.tokens import (
     NeedsLoginError,
     TlsTrustError,
@@ -38,8 +39,16 @@ from m365_copilot_proxy.openai_api.schemas import (
     Usage,
     estimate_tokens,
 )
-from m365_copilot_proxy.openai_api.tools import format_tool_instructions, parse_tool_calls
-from m365_copilot_proxy.openai_api.translate import build_turn_text, first_user_text
+from m365_copilot_proxy.openai_api.tools import (
+    TOOL_CONTRACT,
+    format_tool_instructions,
+    parse_tool_calls,
+)
+from m365_copilot_proxy.openai_api.translate import (
+    build_turn_text,
+    first_user_text,
+    system_texts,
+)
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +98,48 @@ def create_app() -> FastAPI:
     async def list_models() -> ModelList:
         return ModelList(data=[ModelCard(id=name) for name in protocol.available_models()])
 
+    @app.get("/v1/system-prompt", response_model=None)
+    async def system_prompt(
+        key: str | None = None,
+        format: str = "json",
+        contract: bool = True,
+        prompt: bool = True,
+    ) -> object:
+        """The instructions to paste into a declarative agent, and their size.
+
+        Copilot honours an agent's instructions where it ignores the ones the proxy
+        inlines, so this is the text worth moving there — measured against the
+        agent's 8000-character field, never trimmed to fit it.
+        """
+        record = agent_instructions.load(key) if key else agent_instructions.latest()
+        if record is None:
+            return error_response(
+                "No system prompt recorded yet. Send one request through the proxy "
+                "first (and leave M365_RECORD_SYSTEM_PROMPTS on).",
+                status=404,
+            )
+        document = record.compose(contract=contract, prompt=prompt)
+        if format == "text":
+            return PlainTextResponse(document.text)
+        return JSONResponse(document.to_json())
+
+    @app.get("/v1/system-prompts")
+    async def system_prompts() -> JSONResponse:
+        return JSONResponse(
+            {
+                "data": [
+                    {
+                        "key": entry.key,
+                        "model": entry.model,
+                        "label": entry.label,
+                        "recorded_at": entry.recorded_at,
+                        "chars": len(entry.system_text),
+                    }
+                    for entry in agent_instructions.list_records()
+                ]
+            }
+        )
+
     # response_model=None: one route legitimately returns three shapes — a
     # completion, an SSE stream and an error — so FastAPI must not infer one.
     @app.post("/v1/chat/completions", response_model=None)
@@ -134,9 +185,22 @@ async def run_completion(body: ChatCompletionRequest) -> object:
     base_model, requested_work_iq = protocol.parse_model(body.model)
     work_iq = requested_work_iq if requested_work_iq is not None else settings.work_iq
 
+    # A declarative agent replaces the surface AND the system prompt: it carries its
+    # own instructions, which Copilot honours. An `agent:` id we never captured is an
+    # error rather than a silent fallback to plain Copilot under the agent's name.
+    agent = protocol.agent_for_model(base_model)
+    if agent is None and protocol.is_agent_id(base_model):
+        return error_response(
+            f"Unknown declarative agent '{protocol.agent_slug(base_model)}'. Run "
+            "`m365-copilot-proxy capture`, open that agent in the chat window and "
+            "send it a message to record it.",
+            status=400,
+        )
+
     # Keyed on the RAW id, so `claude-sonnet` and `claude-sonnet-work` become
     # separate BizChat conversations instead of one that changes surface midway.
-    key = conversation_key(body.model, first_user_text(body.messages))
+    opening_message = first_user_text(body.messages)
+    key = conversation_key(body.model, opening_message)
     generate_images = base_model == protocol.IMAGE_MODEL or settings.images_always
     # With tools declared we cannot stream: a tool call is only recognisable once
     # the fenced block is complete, and half a block must never reach the client.
@@ -145,16 +209,36 @@ async def run_completion(body: ChatCompletionRequest) -> object:
     # Held for the whole turn so two requests never run on one session. On the
     # streaming path ownership passes to the response generator, which outlives
     # this function — hence the manual acquire/release rather than `async with`.
+    # An agent carries the system prompt, the tool contract AND the tool list in its
+    # own instructions, so a turn inside one sends the message and nothing else —
+    # unless it has drifted out of sync with the client, which is what the setting is
+    # for.
+    inline_instructions = agent is None or settings.agent_send_system
+
     lock = pool.lock_for(key)
     await lock.acquire()
     lock_transferred = False
     try:
         turn = pool.acquire(key, len(body.messages))
+        if turn.is_new:
+            # Recorded whether or not an agent is in play, and recorded WITHOUT the
+            # contract: this is the half that has to be pasted into an agent, and the
+            # contract is composed back on at export time.
+            agent_instructions.record(
+                key,
+                "\n\n".join(system_texts(body.messages)),
+                tool_text=format_tool_instructions(body.tools or [], include_contract=False),
+                model=body.model,
+                label=opening_message,
+            )
         text = build_turn_text(
             body.messages,
             start_index=turn.start_index,
             is_new_conversation=turn.is_new,
-            tool_instructions=format_tool_instructions(body.tools or []),
+            tool_instructions=(
+                format_tool_instructions(body.tools or []) if inline_instructions else ""
+            ),
+            include_system=inline_instructions,
         )
         if not text.strip():
             return error_response("No new message content to send", status=400)
@@ -166,8 +250,27 @@ async def run_completion(body: ChatCompletionRequest) -> object:
             model=base_model,
             generate_images=generate_images,
             work_iq=work_iq,
+            agent=agent,
             result=result,
         )
+
+        # Only a conversation Copilot has never seen needs teaching; a live one has
+        # already been told, and telling it again would spend a message saying so.
+        steps = priming_steps(body, turn) if turn.is_new else []
+        if steps:
+            stream = _primed(
+                partial(
+                    priming.run,
+                    turn.session,
+                    token=token,
+                    steps=steps,
+                    script=priming.load(),
+                    model=base_model,
+                    work_iq=work_iq,
+                    agent=agent,
+                ),
+                stream,
+            )
 
         if body.stream:
             inner = (
@@ -190,6 +293,53 @@ async def run_completion(body: ChatCompletionRequest) -> object:
     finally:
         if not lock_transferred:
             lock.release()
+
+
+async def _primed(
+    prime: Callable[[], Awaitable[None]], stream: AsyncIterator[str]
+) -> AsyncIterator[str]:
+    """Run the opening exchange, then the turn itself.
+
+    `session.chat()` is a generator whose body — the connection included — only runs
+    on first iteration, so wrapping it here is enough to put the priming turns first
+    without either SSE path knowing. Both of them emit their opening chunk before
+    touching this, so the client sees the response open while priming happens.
+    """
+    await prime()
+    async for chunk in stream:
+        yield chunk
+
+
+def priming_steps(body: ChatCompletionRequest, turn: PooledTurn) -> list[priming.Step]:
+    """The opening script for this request, with its placeholders filled.
+
+    Rendered per request rather than once at load time: `{{tools_prompt}}` is the
+    client's CURRENT tool list, which is the point of putting it here rather than
+    freezing it into an agent's instructions.
+    """
+    if not get_settings().priming:
+        return []
+
+    script = priming.load()
+    problems = script.problems_for(body.model)
+    if problems:
+        # Running the steps that happen to parse would leave the conversation primed
+        # for some of the script and not the rest, with the checked replies still
+        # passing. Better to stop than to be half-taught and look fine.
+        raise priming.PrimingConfigError(priming.describe_problems(problems))
+
+    steps = script.steps_for(body.model)
+    if not steps:
+        return []
+    return priming.rendered_steps(
+        steps,
+        {
+            "tools_prompt": format_tool_instructions(body.tools or [], include_contract=False),
+            "system_prompt": "\n\n".join(system_texts(body.messages)),
+            "contract": TOOL_CONTRACT,
+            "user_message": first_user_text(body.messages),
+        },
+    )
 
 
 async def _releasing(inner: AsyncIterator[str], lock: asyncio.Lock) -> AsyncIterator[str]:
@@ -289,8 +439,8 @@ async def buffered_stream(
 
     A tool call is only recognisable once its fenced block is complete, and half a
     block must never reach the client. But the opening chunk is sent BEFORE the turn
-    is collected: agentic clients abort a stream that goes quiet for too long
-    (opencode's `chunkTimeout`), and a reasoning model easily takes a minute.
+    is collected: agentic clients abort a stream that goes quiet for too long, and a
+    reasoning model easily takes a minute.
     """
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     yield _chunk(body.model, completion_id, Delta(role="assistant", content=""))

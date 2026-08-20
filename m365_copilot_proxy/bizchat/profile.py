@@ -13,6 +13,11 @@ not flip a single field — it swaps a whole surface: `agent`, `scenario`, the
 entry per surface, and the proxy serves whichever the caller asked for rather than
 mixing fields from both.
 
+The same file also holds the tenant's **declarative agents** — the custom agents
+built in the Copilot UI, which the proxy can start a thread inside. Careful with the
+word: `agent` as a surface name below means the Work IQ toggle (`work`/`web`), while
+a `DeclarativeAgent` is the custom agent a `threadLevelGptId` selects.
+
 `m365-copilot-proxy capture` writes this file; this module reads it. When a profile
 exists it wins over the built-in defaults, and when it does not, nothing changes.
 """
@@ -49,6 +54,20 @@ CAPTURED_QUERY_KEYS = (
     "isEdu",
     "variants",
 )
+
+#: Query fields that belong to ONE connection and must never be replayed: the
+#: credential, and the ids the proxy mints per turn. A declarative agent records
+#: every other field it is seen with, since which one carries the agent is not
+#: something we can know in advance.
+PER_CONNECTION_QUERY_KEYS = frozenset(
+    {"access_token", "chatsessionid", "clientrequestid", "X-SessionId", "ConversationId"}
+)
+
+#: Recorded fields that name a session rather than a setting. The capture keeps the
+#: value it saw — it is evidence that this connection carries the field at all — but
+#: replaying it would pin every future conversation to a session that ended when the
+#: capture window closed, so the value is minted fresh per conversation instead.
+REFRESHED_QUERY_KEYS = frozenset({"XRoutingParameterSessionKey"})
 
 
 @dataclass
@@ -95,6 +114,66 @@ class Surface:
 
 
 @dataclass
+class DeclarativeAgent:
+    """A custom agent from the Copilot UI, recorded well enough to re-enter it.
+
+    The field that selects one (`threadLevelGptId`) is opaque and undocumented, so
+    nothing here interprets it: capture records what the real client sent and the
+    session replays it verbatim. The id shows up in the connection's query too, which
+    is why the whole surface is kept rather than only the invocation.
+
+    An agent has no model picker and no Work IQ toggle, so its `tone` is whatever its
+    own client was seen sending — `Chat`, on the tenant this was captured from — and
+    not something the caller chooses.
+
+    Recording a chosen list of fields turned out not to be enough: a turn replayed
+    from those alone reaches the agent's thread but is answered by plain Copilot,
+    which ignores the agent's instructions. Whatever asks for them is a field nobody
+    thought to record. So `raw_argument` keeps the WHOLE invocation the client sent,
+    minus the parts that belong to one turn, and the session replays it as a template.
+    """
+
+    surface: Surface = field(default_factory=Surface)
+    thread_level_gpt_id: dict[str, Any] = field(default_factory=dict)
+    extra_extension_parameters: dict[str, Any] = field(default_factory=dict)
+    #: The tone the agent's own client sends. None means it sent none, and so do we.
+    tone: str | None = None
+    source: str | None = None
+    #: The complete captured invocation, per-turn fields stripped. Empty for a profile
+    #: captured before this existed — re-run `capture` to fill it in.
+    raw_argument: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_empty(self) -> bool:
+        """An agent with no id cannot be entered, whatever else was recorded."""
+        return not self.thread_level_gpt_id
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "surface": self.surface.to_json(),
+            "thread_level_gpt_id": self.thread_level_gpt_id,
+            "extra_extension_parameters": self.extra_extension_parameters,
+            "tone": self.tone,
+            "source": self.source,
+            "raw_argument": self.raw_argument,
+        }
+
+    @classmethod
+    def from_json(cls, data: Any) -> DeclarativeAgent:
+        if not isinstance(data, dict):
+            return cls()
+        tone, source = data.get("tone"), data.get("source")
+        return cls(
+            surface=Surface.from_json(data.get("surface")),
+            thread_level_gpt_id=_json_map(data.get("thread_level_gpt_id")),
+            extra_extension_parameters=_json_map(data.get("extra_extension_parameters")),
+            tone=tone if isinstance(tone, str) and tone else None,
+            source=source if isinstance(source, str) and source else None,
+            raw_argument=_json_map(data.get("raw_argument")),
+        )
+
+
+@dataclass
 class TenantProfile:
     """What the real client was observed sending, per surface."""
 
@@ -102,11 +181,17 @@ class TenantProfile:
     surfaces: dict[str, Surface] = field(default_factory=dict)
     #: Model tones are a choice of model, not of surface, so they are shared.
     tones: dict[str, str] = field(default_factory=dict)
+    #: Slug -> declarative agent, exposed as the `agent:<slug>` model ids.
+    agents: dict[str, DeclarativeAgent] = field(default_factory=dict)
     captured_at: str | None = None
 
     @property
     def is_empty(self) -> bool:
-        return not (self.tones or any(not s.is_empty for s in self.surfaces.values()))
+        return not (
+            self.tones
+            or any(not s.is_empty for s in self.surfaces.values())
+            or any(not a.is_empty for a in self.agents.values())
+        )
 
     def surface_for(self, name: str) -> Surface | None:
         """The requested surface, or the only one we have, or None.
@@ -130,6 +215,7 @@ class TenantProfile:
             "captured_at": self.captured_at or datetime.now(tz=UTC).isoformat(),
             "tones": self.tones,
             "surfaces": {name: s.to_json() for name, s in self.surfaces.items()},
+            "agents": {name: a.to_json() for name, a in self.agents.items()},
         }
 
     @classmethod
@@ -151,9 +237,17 @@ class TenantProfile:
             legacy = Surface.from_json(data)
             surfaces[legacy.query.get("agent", WEB)] = legacy
 
+        agents: dict[str, DeclarativeAgent] = {}
+        raw_agents = data.get("agents")
+        if isinstance(raw_agents, dict):
+            for name, raw in raw_agents.items():
+                if isinstance(name, str):
+                    agents[name] = DeclarativeAgent.from_json(raw)
+
         return cls(
             surfaces=surfaces,
             tones=_string_map(data.get("tones")),
+            agents={name: a for name, a in agents.items() if not a.is_empty},
             captured_at=captured_at if isinstance(captured_at, str) else None,
         )
 
@@ -162,6 +256,13 @@ def _string_map(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
     return {k: v for k, v in value.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _json_map(value: Any) -> dict[str, Any]:
+    """A JSON object with values left untouched — the agent fields are opaque."""
+    if not isinstance(value, dict):
+        return {}
+    return {k: v for k, v in value.items() if isinstance(k, str)}
 
 
 def _string_list(value: Any) -> list[str]:
@@ -204,9 +305,10 @@ def load() -> TenantProfile:
         profile = TenantProfile()
     else:
         log.info(
-            "Loaded tenant profile: surfaces=%s, %d tones (captured %s)",
+            "Loaded tenant profile: surfaces=%s, %d tones, %d agents (captured %s)",
             sorted(name for name in profile.surfaces if profile.has_surface(name)),
             len(profile.tones),
+            len(profile.agents),
             profile.captured_at,
         )
 

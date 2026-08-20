@@ -87,6 +87,14 @@ AGENT_WEB = "web"
 WORK_SUFFIX = "-work"
 WEB_SUFFIX = "-web"
 
+#: Model id prefix selecting a captured declarative agent — a custom agent built in
+#: the Copilot UI, entered through `threadLevelGptId` and a matching `gptId` query
+#: field. Not to be confused with the `agent` QUERY field above, which names the Work
+#: IQ surface — an agent connection sets that field to `Agent`, a third value. An
+#: agent id takes no Work IQ suffix and offers no choice of model: it serves the tone
+#: its own client was seen sending.
+AGENT_ID_PREFIX = "agent:"
+
 #: Static query-string fields identifying the client surface.
 QUERY_DEFAULTS = {
     "source": '"officeweb"',
@@ -224,6 +232,37 @@ def model_tones() -> dict[str, str]:
     return {**MODEL_TONES, **tenant_profile.load().tones}
 
 
+def declarative_agents() -> dict[str, tenant_profile.DeclarativeAgent]:
+    """The declarative agents `capture` recorded, by slug."""
+    return tenant_profile.load().agents
+
+
+def is_agent_id(model: str | None) -> bool:
+    return bool(model) and model.startswith(AGENT_ID_PREFIX)  # type: ignore[union-attr]
+
+
+def agent_slug(model: str | None) -> str:
+    """The slug inside an `agent:<slug>` id, or "" for anything else."""
+    return model[len(AGENT_ID_PREFIX) :] if is_agent_id(model) else ""
+
+
+def agent_for_model(model: str | None) -> tenant_profile.DeclarativeAgent | None:
+    """The captured agent an id names, or None — including for a plain model id.
+
+    None for an `agent:` id that was never captured is deliberate: the caller turns
+    that into an error rather than quietly serving plain Copilot under the agent's
+    name.
+    """
+    agent = declarative_agents().get(agent_slug(model)) if is_agent_id(model) else None
+    return agent if agent is not None and not agent.is_empty else None
+
+
+def _agent_surface(
+    agent: tenant_profile.DeclarativeAgent | None,
+) -> tenant_profile.Surface | None:
+    return agent.surface if agent is not None and not agent.surface.is_empty else None
+
+
 def surface_name(work_iq: bool | None) -> str:
     """Which captured surface a Work IQ choice corresponds to.
 
@@ -262,13 +301,24 @@ def _surface(work_iq: bool | None) -> tenant_profile.Surface | None:
     return substitute
 
 
-def query_defaults(work_iq: bool | None = None) -> dict[str, str]:
+def query_defaults(
+    work_iq: bool | None = None,
+    agent: tenant_profile.DeclarativeAgent | None = None,
+) -> dict[str, str]:
     """Static WebSocket query fields for the requested surface.
 
     This is where a work tenant diverges from an individual one, and where Work IQ
     on diverges from off (`agent`, `scenario`, and the whole `variants` string) —
     exactly the kind of thing that is not worth guessing.
+
+    A declarative agent replaces the lot: it was recorded as one whole connection,
+    so it is replayed as one rather than merged with a Work IQ choice its UI does
+    not offer.
     """
+    agent_surface = _agent_surface(agent)
+    if agent_surface is not None:
+        return dict(agent_surface.query)
+
     captured = (_surface(work_iq) or tenant_profile.Surface()).query
     merged = dict(QUERY_DEFAULTS)
     for key in (*QUERY_DEFAULTS, "isEdu"):
@@ -283,16 +333,24 @@ def query_defaults(work_iq: bool | None = None) -> dict[str, str]:
     return merged
 
 
-def variants(work_iq: bool | None = None) -> str:
+def variants(
+    work_iq: bool | None = None,
+    agent: tenant_profile.DeclarativeAgent | None = None,
+) -> str:
     """The comma-separated feature variants for the requested surface."""
-    surface = _surface(work_iq)
+    surface = _agent_surface(agent) or _surface(work_iq)
     captured = surface.query.get("variants") if surface else None
     return captured if captured else ",".join(VARIANTS)
 
 
-def option_sets(*, work_iq: bool | None = None, generate_images: bool = False) -> list[str]:
+def option_sets(
+    *,
+    work_iq: bool | None = None,
+    generate_images: bool = False,
+    agent: tenant_profile.DeclarativeAgent | None = None,
+) -> list[str]:
     """The optionsSets to send for the requested surface."""
-    surface = _surface(work_iq)
+    surface = _agent_surface(agent) or _surface(work_iq)
     captured = surface.option_sets if surface else []
     sets = list(captured) if captured else list(CODE_INTERPRETER_OPTIONS_SETS)
     if generate_images:
@@ -301,10 +359,13 @@ def option_sets(*, work_iq: bool | None = None, generate_images: bool = False) -
 
 
 def allowed_message_types(
-    *, work_iq: bool | None = None, generate_images: bool = False
+    *,
+    work_iq: bool | None = None,
+    generate_images: bool = False,
+    agent: tenant_profile.DeclarativeAgent | None = None,
 ) -> list[str]:
     """The message types we declare we can handle for the requested surface."""
-    surface = _surface(work_iq)
+    surface = _agent_surface(agent) or _surface(work_iq)
     captured = surface.allowed_message_types if surface else []
     types = list(captured) if captured else list(ALLOWED_MESSAGE_TYPES)
     if generate_images and IMAGE_MESSAGE_TYPE not in types:
@@ -312,12 +373,27 @@ def allowed_message_types(
     return types
 
 
-def plugins(work_iq: bool | None = None) -> list[dict[str, str]]:
-    """The plugin list for the requested surface, captured if available.
+def plugins(
+    work_iq: bool | None = None,
+    agent: tenant_profile.DeclarativeAgent | None = None,
+) -> list[dict[str, str]] | None:
+    """The plugin list to send, or None to send no `plugins` field at all.
 
     An empty captured list means "this surface sends no plugins" and is honoured;
-    only a surface that never recorded them (`None`) falls back to the built-in.
+    a surface that never recorded them falls back to the built-in Bing entry, which
+    is what the observed web client sends on a plain turn.
+
+    A declarative agent gets no such fallback. A real capture shows an agent turn
+    carrying no `plugins` field whatsoever, so inventing one would hand the agent a
+    plugin its own client never asks for.
     """
+    agent_surface = _agent_surface(agent)
+    if agent_surface is not None:
+        # None (never sent the field) and [] (sent it empty) are different things.
+        if agent_surface.plugins is None:
+            return None
+        return [dict(p) for p in agent_surface.plugins]
+
     surface = _surface(work_iq)
     if surface is not None and surface.plugins is not None:
         return [dict(p) for p in surface.plugins]
@@ -336,6 +412,9 @@ def parse_model(model: str | None) -> tuple[str, bool | None]:
     """
     if not model:
         return "", None
+    if is_agent_id(model):
+        # An agent has no Work IQ toggle, so a slug ending in `-work` is a name.
+        return model, None
     if model in model_tones():
         return model, None
     for suffix, work_iq in ((WORK_SUFFIX, True), (WEB_SUFFIX, False)):
@@ -344,13 +423,22 @@ def parse_model(model: str | None) -> tuple[str, bool | None]:
     return model, None
 
 
-def tone_for_model(model: str | None) -> str:
+def tone_for_model(model: str | None) -> str | None:
     """Resolve a requested model id to a `tone` the server accepts.
 
     An unmapped `claude-*` id (clients send things like `claude-opus-4-8`) must not
     fall back to the GPT tone — it would serve GPT under a Claude name. Route it to
     the Claude tone instead; everything else gets the default.
+
+    An agent id resolves to whatever tone the real client sent for that agent — a
+    captured work tenant sent `Chat` — or to None when it sent none. The agent UI has
+    no model picker, so there is nothing for a caller to choose; replaying what was
+    observed avoids exactly the guess `capture` exists to avoid.
     """
+    if is_agent_id(model):
+        agent = agent_for_model(model)
+        return agent.tone if agent is not None else None
+
     tones = model_tones()
     default = tones.get(DEFAULT_MODEL, MODEL_TONES[DEFAULT_MODEL])
     if not model:
@@ -367,7 +455,9 @@ def available_models() -> list[str]:
     """Every model id, each also offered with the Work IQ suffix.
 
     The `-web` suffix is accepted on input but not advertised — it would be a third
-    copy of the list saying what the default already says.
+    copy of the list saying what the default already says. Declarative agents are
+    listed once each: they have neither a Work IQ toggle nor a model picker.
     """
     base = list(model_tones())
-    return base + [f"{name}{WORK_SUFFIX}" for name in base]
+    agents = [f"{AGENT_ID_PREFIX}{slug}" for slug in declarative_agents()]
+    return base + [f"{name}{WORK_SUFFIX}" for name in base] + agents

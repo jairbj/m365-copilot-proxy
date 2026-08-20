@@ -237,3 +237,94 @@ def test_a_new_capture_is_picked_up_without_a_restart():
 
     tenant_profile.save(TenantProfile(tones={"b": "B"}))
     assert protocol.tone_for_model("b") == "B"
+
+
+#: One captured agent, shortened. The gpt id is opaque on purpose: nothing in the
+#: proxy reads inside it, so the test does not either.
+AGENT = {
+    "surface": {
+        "query": {"agent": "work", "scenario": "officeweb", "variants": "feature.agent"},
+        "option_sets": ["agent_set"],
+        "allowed_message_types": ["Chat"],
+        "plugins": [{"Id": "Custom", "Source": "Gpt"}],
+    },
+    "thread_level_gpt_id": {"gptId": "agent-guid"},
+    "extra_extension_parameters": {"k": "v"},
+    "tone": None,
+    "source": "officeweb",
+}
+
+
+class TestDeclarativeAgents:
+    def test_a_captured_agent_round_trips(self):
+        write_profile({"agents": {"sales-bot": AGENT}})
+
+        agent = tenant_profile.load().agents["sales-bot"]
+        assert agent.thread_level_gpt_id == {"gptId": "agent-guid"}
+        assert agent.extra_extension_parameters == {"k": "v"}
+        assert agent.tone is None
+        assert agent.surface.option_sets == ["agent_set"]
+        assert TenantProfile.from_json(tenant_profile.load().to_json()).agents == {
+            "sales-bot": agent
+        }
+
+    def test_a_profile_from_before_agents_existed_still_loads(self):
+        write_profile({"surfaces": {"work": WORK_SURFACE}, "tones": {"a": "A"}})
+
+        assert tenant_profile.load().agents == {}
+        assert protocol.available_models().count("a") == 1
+
+    def test_an_agent_without_an_id_cannot_be_entered_and_is_dropped(self):
+        write_profile({"agents": {"broken": {"surface": WORK_SURFACE}}})
+
+        assert tenant_profile.load().agents == {}
+        assert protocol.agent_for_model("agent:broken") is None
+
+    def test_an_agent_is_offered_as_one_model_id(self):
+        write_profile({"agents": {"sales-bot": AGENT}, "tones": {"a": "A"}})
+
+        models = protocol.available_models()
+        assert models.count("agent:sales-bot") == 1
+        # No Work IQ twin: the agent UI has no such toggle.
+        assert "agent:sales-bot-work" not in models
+
+    def test_an_agent_serves_its_own_surface_whole(self):
+        write_profile(
+            {"surfaces": {"work": WORK_SURFACE, "web": WEB_SURFACE}, "agents": {"b": AGENT}}
+        )
+        agent = protocol.agent_for_model("agent:b")
+
+        assert protocol.option_sets(work_iq=True, agent=agent) == ["agent_set"]
+        assert protocol.plugins(True, agent) == [{"Id": "Custom", "Source": "Gpt"}]
+        assert protocol.variants(True, agent) == "feature.agent"
+        # The connection is replayed as recorded, not merged with a Work IQ choice.
+        assert protocol.query_defaults(True, agent) == AGENT["surface"]["query"]
+
+    def test_an_agent_that_sends_no_plugins_gets_none_invented_for_it(self):
+        # A real capture shows no `plugins` field on an agent turn. A surface with
+        # none recorded still falls back to Bing, which is what a plain turn sends.
+        surface = {k: v for k, v in AGENT["surface"].items() if k != "plugins"}
+        plugin_less = {**AGENT, "surface": surface}
+        write_profile({"agents": {"b": plugin_less}, "surfaces": {"web": WEB_SURFACE}})
+
+        assert protocol.plugins(agent=protocol.agent_for_model("agent:b")) is None
+        assert protocol.plugins(False) == [protocol.BING_PLUGIN]
+
+    def test_an_agent_that_sends_an_empty_plugin_list_sends_one(self):
+        # Empty is a thing the client said; absent is a thing it never sent.
+        write_profile({"agents": {"b": {**AGENT, "surface": {**AGENT["surface"], "plugins": []}}}})
+
+        assert protocol.plugins(agent=protocol.agent_for_model("agent:b")) == []
+
+    def test_an_agent_id_carries_no_tone_of_its_own_making(self):
+        write_profile({"agents": {"b": AGENT}})
+
+        assert protocol.tone_for_model("agent:b") is None
+        # Unknown agent: still no tone invented for it.
+        assert protocol.tone_for_model("agent:nope") is None
+
+    def test_an_agent_named_like_a_suffix_is_not_split(self):
+        write_profile({"agents": {"my-work": AGENT}})
+
+        assert protocol.parse_model("agent:my-work") == ("agent:my-work", None)
+        assert protocol.agent_for_model("agent:my-work") is not None
