@@ -36,6 +36,10 @@ class FakeBizChat:
 
     #: Frames the server sends after the chat invocation arrives.
     script: list[dict[str, Any]] = field(default_factory=list)
+    #: One script per chat invocation, for turns that must answer differently the
+    #: second time — an empty answer followed by a real one, say. Falls back to
+    #: `script` once exhausted, so tests that do not care never notice.
+    scripts: list[list[dict[str, Any]]] = field(default_factory=list)
     received: list[dict[str, Any]] = field(default_factory=list)
     urls: list[str] = field(default_factory=list)
     #: Set when the client sends the mandatory Metrics frame.
@@ -80,7 +84,11 @@ class FakeBizChat:
                     await connection.send(frames.encode({"type": 3, "invocationId": "1"}))
                     continue
                 if frame.get("target") == "chat":
-                    for outgoing in self.script:
+                    turn = len([f for f in self.received if f.get("target") == "chat"]) - 1
+                    outgoing_frames = (
+                        self.scripts[turn] if turn < len(self.scripts) else self.script
+                    )
+                    for outgoing in outgoing_frames:
                         await connection.send(frames.encode(outgoing))
 
 

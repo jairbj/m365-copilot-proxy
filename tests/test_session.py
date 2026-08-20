@@ -240,3 +240,103 @@ async def test_a_wss_url_connects_without_an_ssl_argument_error(monkeypatch):
     with pytest.raises(OSError):  # connection refused, NOT ValueError
         async for _ in session.chat(token=make_token(), text="hello"):
             pass
+
+
+class TestResendingAnEmptyTurn:
+    """Copilot sometimes produces nothing; the same message sent again works."""
+
+    @pytest.fixture(autouse=True)
+    def no_waiting(self, monkeypatch):
+        from m365_copilot_proxy.bizchat import session as session_module
+
+        monkeypatch.setattr(session_module, "EMPTY_RETRY_DELAY", 0)
+        get_settings.cache_clear()
+        yield
+        get_settings.cache_clear()
+
+    async def chat(self, fake, **kwargs) -> tuple[str, TurnResult]:
+        session = CopilotSession()
+        bind_session_to(session, fake)
+        result = TurnResult()
+        answer = "".join(
+            [chunk async for chunk in session.chat(token=make_token(), text="hi", result=result)]
+        )
+        return answer, result
+
+    def turns(self, fake) -> int:
+        return len([f for f in fake.received if f.get("target") == "chat"])
+
+    async def test_an_empty_turn_is_sent_again(self, fake_bizchat):
+        fake = await fake_bizchat(
+            [],
+            scripts=[[COMPLETION], [snapshot_frame("here it is"), COMPLETION]],
+        )
+
+        answer, _ = await self.chat(fake)
+        assert answer == "here it is"
+        assert self.turns(fake) == 2
+
+    async def test_the_client_never_sees_the_empty_one(self, fake_bizchat):
+        # Nothing was emitted before the retry, which is the only reason resending is
+        # safe at all: a second attempt cannot contradict what was already sent.
+        fake = await fake_bizchat(
+            [],
+            scripts=[[COMPLETION], [snapshot_frame("real answer"), COMPLETION]],
+        )
+        session = CopilotSession()
+        bind_session_to(session, fake)
+
+        chunks = [chunk async for chunk in session.chat(token=make_token(), text="hi")]
+        assert chunks == ["real answer"]
+
+    async def test_it_gives_up_and_reports_the_last_attempt(self, fake_bizchat):
+        fake = await fake_bizchat([COMPLETION])
+
+        answer, result = await self.chat(fake)
+        assert answer == ""
+        # Three turns: the first plus the two retries the default allows.
+        assert self.turns(fake) == 3
+        assert result.text == ""
+
+    async def test_a_refusal_is_not_argued_with(self, fake_bizchat):
+        # Disengaged is the safety layer saying no; asking again spends messages.
+        fake = await fake_bizchat(
+            [snapshot_frame("", messageType="Disengaged"), COMPLETION],
+        )
+
+        _, result = await self.chat(fake)
+        assert result.disengaged
+        assert self.turns(fake) == 1
+
+    async def test_retries_can_be_turned_off(self, fake_bizchat, monkeypatch):
+        monkeypatch.setenv("M365_EMPTY_RETRIES", "0")
+        get_settings.cache_clear()
+        fake = await fake_bizchat([COMPLETION])
+
+        await self.chat(fake)
+        assert self.turns(fake) == 1
+
+    async def test_the_failed_attempt_leaves_nothing_behind(self, fake_bizchat):
+        # A messageType from the attempt that failed must not be read as this turn's.
+        fake = await fake_bizchat(
+            [],
+            scripts=[
+                [snapshot_frame("", messageType="Progress"), COMPLETION],
+                [snapshot_frame("done", turnState="Completed"), COMPLETION],
+            ],
+        )
+
+        answer, result = await self.chat(fake)
+        assert answer == "done"
+        assert result.message_type is None
+        assert result.turn_state == "Completed"
+
+    async def test_a_resent_turn_stays_in_the_same_conversation(self, fake_bizchat):
+        fake = await fake_bizchat(
+            [],
+            scripts=[[COMPLETION], [snapshot_frame("ok"), COMPLETION]],
+        )
+        await self.chat(fake)
+
+        ids = {parse_qs(urlparse(url).query)["ConversationId"][0] for url in fake.urls}
+        assert len(ids) == 1

@@ -28,6 +28,10 @@ from m365_copilot_proxy.config import get_settings
 
 log = logging.getLogger(__name__)
 
+#: How long to wait before resending a turn that produced nothing, doubling per
+#: attempt. A module constant so a test can set it to zero instead of sleeping.
+EMPTY_RETRY_DELAY = 1.0
+
 #: A piece of streamed text: an incremental `writeAtCursor` delta to append, or a
 #: full-text snapshot of the answer so far. The server emits both, interleaved.
 TextPiece = tuple[Literal["delta", "snapshot"], str]
@@ -62,6 +66,17 @@ class TurnResult:
     @property
     def disengaged(self) -> bool:
         return self.message_type == "Disengaged"
+
+    def reset(self) -> None:
+        """Forget an attempt, so only the one that answers is reported."""
+        self.text = ""
+        self.images = []
+        self.throttle = None
+        self.message_type = None
+        self.content_origin = None
+        self.turn_state = None
+        self.turn_count = None
+        self.scores = {}
 
 
 class CopilotSession:
@@ -117,6 +132,75 @@ class CopilotSession:
         )
 
     async def chat(
+        self,
+        *,
+        token: str,
+        text: str,
+        model: str = protocol.DEFAULT_MODEL,
+        generate_images: bool = False,
+        work_iq: bool | None = None,
+        agent: DeclarativeAgent | None = None,
+        result: TurnResult | None = None,
+    ) -> AsyncIterator[str]:
+        """Send one turn and yield the answer, resending it if nothing comes back.
+
+        Copilot sometimes finishes a turn having produced no content at all. Sending
+        the very same message again works, which is a retry loop people were running
+        by hand. Resending is safe here and nowhere else: an empty answer means
+        nothing has reached the client yet, so the second attempt cannot duplicate or
+        contradict what the first one said.
+
+        A `Disengaged` turn is never resent — that is the safety layer refusing, and
+        asking again spends messages insisting where the answer was already no.
+
+        Pass a `TurnResult` in to read the turn's metadata afterwards — an async
+        generator cannot return a value to its consumer.
+        """
+        result = result if result is not None else TurnResult()
+        attempts = 1 + max(0, get_settings().empty_retries)
+
+        for attempt in range(1, attempts + 1):
+            emitted = False
+            turn = self._run_turn(
+                token=token,
+                text=text,
+                model=model,
+                generate_images=generate_images,
+                work_iq=work_iq,
+                agent=agent,
+                result=result,
+            )
+            try:
+                async for chunk in turn:
+                    emitted = True
+                    yield chunk
+            finally:
+                # Closing it here, rather than leaving it to the garbage collector,
+                # is what still cancels the turn when the caller hangs up mid-stream:
+                # the stop frame lives in that generator's own `finally`.
+                await turn.aclose()
+
+            if emitted or result.text.strip() or result.disengaged:
+                return
+            if attempt == attempts:
+                # Out of attempts: the caller reads the last attempt's metadata and
+                # explains the empty answer, exactly as it did before retries existed.
+                return
+
+            log.warning(
+                "Empty answer (messageType=%s, turnState=%s) — resending the same "
+                "turn, attempt %d of %d",
+                result.message_type,
+                result.turn_state,
+                attempt + 1,
+                attempts,
+            )
+            await asyncio.sleep(EMPTY_RETRY_DELAY * 2 ** (attempt - 1))
+            # A stale messageType from the attempt that failed must not be read as
+            # this turn's outcome.
+            result.reset()
+
+    async def _run_turn(
         self,
         *,
         token: str,

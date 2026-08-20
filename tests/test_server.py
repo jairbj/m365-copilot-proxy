@@ -827,3 +827,51 @@ async def test_a_broken_script_is_ignored_when_priming_is_off(
 
     assert response.status_code == 200
     assert sent_texts(fake) == ["hello"]
+
+
+async def test_a_streamed_turn_that_came_back_empty_is_resent(
+    client, fake_bizchat, monkeypatch
+):
+    # The SSE path must not show an empty answer and then a real one: the retry
+    # happens before any content chunk leaves.
+    from m365_copilot_proxy.bizchat import session as session_module
+
+    monkeypatch.setattr(session_module, "EMPTY_RETRY_DELAY", 0)
+    fake = await fake_bizchat(
+        [], scripts=[[COMPLETION], [snapshot_frame("the real answer"), COMPLETION]]
+    )
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "claude-sonnet",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    content = "".join(
+        event["choices"][0]["delta"].get("content") or "" for event in sse_events(response.text)
+    )
+    assert content == "the real answer"
+    assert "returned no content" not in response.text
+
+
+async def test_an_answer_that_never_arrives_still_explains_itself(
+    client, fake_bizchat, monkeypatch
+):
+    from m365_copilot_proxy.bizchat import session as session_module
+
+    monkeypatch.setattr(session_module, "EMPTY_RETRY_DELAY", 0)
+    fake = await fake_bizchat([COMPLETION])
+    route_new_sessions_to(fake, monkeypatch)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "claude-sonnet", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    # Retries exhausted: the note is what it always was.
+    assert "returned no content" in response.json()["choices"][0]["message"]["content"]
+    assert len(chat_invocations(fake)) == 3
